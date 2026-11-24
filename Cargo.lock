@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "rover-ai"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "chrono",
  "hex",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "rover-browser"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "cef",
  "chrono",
@@ -1232,13 +1232,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tiny_http",
+ "ureq 2.12.1",
  "url",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rover-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1261,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "rover-net"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aho-corasick",
  "bincode",

@@ -55,14 +55,14 @@ fn main() {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         #[cfg(target_os = "windows")]
         attach_parent_console_if_present();
-        println!("Rover 2.0.0 (Native Rust + Pure Chromium 156 CEF — Inverted Mars Edition)");
+        println!("Rover 2.0.1 (Native Rust + Pure Chromium 156 CEF — Inverted Mars Edition)");
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         #[cfg(target_os = "windows")]
         attach_parent_console_if_present();
         println!(
-            "Rover 2.0.0 — Pure Chromium (CEF) Rust browser & ultra-low-token autonomous AI agent\n\n\
+            "Rover 2.0.1 — Pure Chromium (CEF) Rust browser & ultra-low-token autonomous AI agent\n\n\
              Usage:\n  \
                rover [URL]                    Launch native Rover Chromium Browser\n  \
                rover --private [URL]          Launch Private Window\n  \
@@ -307,16 +307,56 @@ fn serve_ui(preferred_port: u16) {
             continue;
         }
 
-        let (content_type, body) = if url.starts_with("/playground") {
+        let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+        let (content_type, body) = if path == "/playground" {
             ("text/html; charset=utf-8", playground_html.clone())
-        } else if url.starts_with("/home") {
+        } else if path == "/home" {
             ("text/html; charset=utf-8", home_html.clone())
-        } else if url.starts_with("/api/status") {
+        } else if path == "/api/suggest" {
+            let mut q = String::new();
+            let mut mode = "search".to_string();
+            let mut live = false;
+            for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                match k.as_ref() {
+                    "q" => q = v.into_owned(),
+                    "mode" => mode = v.into_owned(),
+                    "live" => live = v.as_ref() == "1" || v.as_ref() == "true",
+                    _ => {}
+                }
+            }
+            let engine = store
+                .get_str("search_engine")
+                .unwrap_or_else(|| "duckduckgo".into());
+            let remote = if live {
+                rover_browser::omnibox::fetch_search_suggestions(&engine, &q)
+            } else {
+                rover_browser::omnibox::cached_search_suggestions(&engine, &q)
+            };
+            let suggestions = if mode == "search" {
+                rover_browser::omnibox::suggest_for_search_bar(&store, &q, &remote)
+            } else {
+                rover_browser::omnibox::suggest(&store, &q, &remote)
+            };
+            let inline = if mode == "search" {
+                None
+            } else {
+                rover_browser::omnibox::inline_completion(&store, &q)
+            };
+            (
+                "application/json",
+                serde_json::json!({
+                    "enabled": true,
+                    "inline": inline,
+                    "suggestions": suggestions
+                })
+                .to_string(),
+            )
+        } else if path == "/api/status" {
             (
                 "application/json",
                 serde_json::json!({
                     "app": "Rover",
-                    "version": "2.0.0",
+                    "version": "2.0.1",
                     "theme": "Inverted Mars",
                     "engine": "Rust",
                     "providers": 26,

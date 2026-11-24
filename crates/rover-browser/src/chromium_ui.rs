@@ -181,9 +181,9 @@ pub fn render_chrome_bar_html(token: &str) -> String {
     <button class="tbtn" onclick="cmd({{cmd:'home'}})" title="Home">
       <svg viewBox="0 0 20 20"><polyline points="3,10 10,3.6 17,10"/><polyline points="5.3,8.4 5.3,16.5 14.7,16.5 14.7,8.4"/></svg>
     </button>
-    <input class="omni" id="omni" type="text" placeholder="Search or enter address"
-           onkeydown="if(event.key==='Enter'){{cmd({{cmd:'navigate',url:this.value}});this.blur();}}"
-           onfocus="this.select()">
+    <input class="omni" id="omni" type="text" placeholder="Search or enter address" autocomplete="off" spellcheck="false"
+           onfocus="this.select(); lastOmniTyped = this.value;"
+           onblur="setTimeout(()=>cmd({{cmd:'omni_hide'}}), 120)">
     <button class="tbtn" id="star-btn" onclick="cmd({{cmd:'toggle_bookmark'}})" title="Bookmark this page (Ctrl+D)">
       <svg viewBox="0 0 20 20"><polygon points="10,2.8 12.2,7.3 17.2,8 13.6,11.5 14.4,16.5 10,14.1 5.6,16.5 6.4,11.5 2.8,8 7.8,7.3"/></svg>
     </button>
@@ -218,6 +218,8 @@ pub fn render_chrome_bar_html(token: &str) -> String {
 
 <script>
   const TOKEN = "{token}";
+  let lastOmniTyped = '';
+  let omniPopupOpen = false;
   function cmd(payload) {{
     fetch('/api/cmd?t=' + TOKEN, {{
       method:'POST',
@@ -226,10 +228,101 @@ pub fn render_chrome_bar_html(token: &str) -> String {
     }}).catch(()=>{{}});
   }}
   function openNativeMenu(kind, el) {{
+    cmd({{ cmd:'omni_hide' }});
     const r = el.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     cmd({{ cmd:'show_menu', kind, x: Math.round(r.right * dpr), y: Math.round(r.bottom * dpr) }});
   }}
+  function openNativeTabMenu(index, cx, cy) {{
+    cmd({{ cmd:'omni_hide' }});
+    const dpr = window.devicePixelRatio || 1;
+    cmd({{ cmd:'show_tab_menu', index, x: Math.round(cx * dpr), y: Math.round(cy * dpr) }});
+  }}
+  function omniRect() {{
+    const o = document.getElementById('omni');
+    const r = o.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    return {{
+      x: Math.round(r.left * dpr),
+      y: Math.round((r.bottom + 3) * dpr),
+      w: Math.round(r.width * dpr),
+      dpr
+    }};
+  }}
+  (function initOmni() {{
+    const o = document.getElementById('omni');
+    o.addEventListener('input', () => {{
+      const val = o.value;
+      const grew = val.length > lastOmniTyped.length && val.startsWith(lastOmniTyped);
+      const cursorAtEnd = o.selectionStart === val.length && o.selectionEnd === val.length;
+      lastOmniTyped = val;
+      if (!val.trim()) {{
+        omniPopupOpen = false;
+        cmd({{ cmd:'omni_hide' }});
+        return;
+      }}
+      omniPopupOpen = true;
+      cmd({{ cmd:'omni_query', text: val, grew, cursor_at_end: cursorAtEnd, rect: omniRect() }});
+    }});
+    o.addEventListener('keydown', (e) => {{
+      if (e.key === 'ArrowDown') {{
+        e.preventDefault();
+        if (!omniPopupOpen && o.value.trim()) {{
+          omniPopupOpen = true;
+          cmd({{ cmd:'omni_query', text: o.value, grew: false, cursor_at_end: true, rect: omniRect() }});
+        }} else {{
+          cmd({{ cmd:'omni_move', delta: 1 }});
+        }}
+      }} else if (e.key === 'ArrowUp') {{
+        e.preventDefault();
+        cmd({{ cmd:'omni_move', delta: -1 }});
+      }} else if (e.key === 'Tab') {{
+        if (o.selectionEnd > o.selectionStart && o.selectionEnd === o.value.length) {{
+          e.preventDefault();
+          o.setSelectionRange(o.value.length, o.value.length);
+          lastOmniTyped = o.value;
+        }} else if (omniPopupOpen) {{
+          e.preventDefault();
+          cmd({{ cmd:'omni_move', delta: 1 }});
+        }}
+      }} else if (e.key === 'Escape') {{
+        if (omniPopupOpen) {{
+          e.preventDefault();
+          omniPopupOpen = false;
+          o.value = lastOmniTyped;
+          cmd({{ cmd:'omni_hide' }});
+        }} else {{
+          o.blur();
+        }}
+      }} else if (e.key === 'Enter') {{
+        e.preventDefault();
+        omniPopupOpen = false;
+        cmd({{ cmd:'omni_submit', text: o.value }});
+        o.blur();
+      }}
+    }});
+  }})();
+  window.roverOmniInline = (typed, full) => {{
+    const o = document.getElementById('omni');
+    if (document.activeElement !== o || o.value !== typed) return;
+    if (full && full.length > typed.length && full.toLowerCase().startsWith(typed.toLowerCase())) {{
+      o.value = full;
+      o.setSelectionRange(typed.length, full.length);
+    }}
+  }};
+  window.roverOmniPreview = (text) => {{
+    const o = document.getElementById('omni');
+    o.value = text != null ? text : lastOmniTyped;
+    o.setSelectionRange(o.value.length, o.value.length);
+  }};
+  window.roverOmniCommit = (text) => {{
+    const o = document.getElementById('omni');
+    omniPopupOpen = false;
+    o.value = text || '';
+    lastOmniTyped = o.value;
+    o.blur();
+  }};
+  window.roverOmniClosed = () => {{ omniPopupOpen = false; }};
   window.roverFocusOmni = () => {{
     const o = document.getElementById('omni');
     o.focus(); o.select();
@@ -255,6 +348,7 @@ pub fn render_chrome_bar_html(token: &str) -> String {
       d.className = 'tab' + (i === st.active ? ' active' : '') + (t.sleeping ? ' sleeping' : '') + (t.pinned ? ' pinned' : '');
       d.onclick = () => cmd({{ cmd:'select_tab', index: i }});
       d.onauxclick = (e) => {{ if (e.button === 1) {{ e.preventDefault(); cmd({{ cmd:'close_tab', index: i }}); }} }};
+      d.oncontextmenu = (e) => {{ e.preventDefault(); openNativeTabMenu(i, e.clientX, e.clientY); }};
       const dot = t.group_color ? `<span class="tab-dot" style="background:${{t.group_color}}"></span>` : '';
       const title = (t.sleeping ? '☾ ' : '') + (t.title || 'New tab');
       d.innerHTML = t.pinned
@@ -267,6 +361,7 @@ pub fn render_chrome_bar_html(token: &str) -> String {
     const omni = document.getElementById('omni');
     if (document.activeElement !== omni) {{
       omni.value = (!st.url || st.url === 'rover:start' || st.url === 'about:blank') ? '' : st.url;
+      lastOmniTyped = omni.value;
     }}
     document.getElementById('back-btn').disabled = !st.can_back;
     document.getElementById('fwd-btn').disabled = !st.can_forward;
@@ -715,6 +810,10 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
               <option value="brave"${{se==='brave'?' selected':''}}>Brave Search</option>
               <option value="ecosia"${{se==='ecosia'?' selected':''}}>Ecosia</option>
             </select></div>
+          <div class="row"><label>Startup tabs</label>
+            <input type="checkbox"${{STATE.restore_tabs_on_startup!==false?' checked':''}} onchange="cmd({{cmd:'set_setting',key:'restore_tabs_on_startup',val:this.checked}});toast('Startup tab persistence updated.')"> Reopen previous tabs on startup</div>
+          <div class="row"><label>Autocomplete</label>
+            <input type="checkbox"${{STATE.autocomplete!==false?' checked':''}} onchange="cmd({{cmd:'set_setting',key:'autocomplete',val:this.checked}});toast('Autocomplete preference updated.')"> Show address bar and search bar suggestions</div>
           <div class="row"><label>Bookmarks bar</label>
             <input type="checkbox"${{STATE.bookmarks_bar_visible?' checked':''}} onchange="cmd({{cmd:'toggle_bookmarks_bar'}})"> Show bookmarks bar (when bookmarks exist)</div>
           <div class="row"><label>Tab grouping</label>
@@ -817,7 +916,7 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
     }} else {{
       el.innerHTML = `<h1><img src="${{ICON}}" width="34" height="34" style="border-radius:50%"> About Rover</h1>
         <div class="card">
-          <p><strong>Rover 2.0.0</strong> — a pure open-source <strong>Chromium (CEF 156)</strong> browser rebuilt in Rust with an integrated low-token AI agent.</p>
+          <p><strong>Rover 2.0.1</strong> — a pure open-source <strong>Chromium (CEF 156)</strong> browser rebuilt in Rust with an integrated low-token AI agent.</p>
           <p class="muted" style="margin-top:10px">• Engine: Pure Chromium 156 (libcef.dll) — zero Microsoft Edge / WebView2.<br>
           • Speed: 2.00 µs Aho-Corasick adblock · 2.0M lines/sec Pi-hole parser · ChaCha20-Poly1305 AEAD.<br>
           • Token Efficiency: DOM Delta Snapshots · Compact DSL · Semantic Pruner · Zero-token Rover Local.<br>

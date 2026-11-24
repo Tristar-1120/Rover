@@ -83,7 +83,7 @@ pub struct Tab {
     pub last_active: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Workspace {
     pub name: String,
     pub tabs: Vec<Tab>,
@@ -474,4 +474,260 @@ impl TabStrip {
             self.open_tab("rover:start", "New Tab");
         }
     }
+
+    /// Replaces the sole remaining tab with a fresh `rover:start` tab instead of
+    /// exiting the browser, remembering the previous page in `closed_stack` so
+    /// `Ctrl+Shift+T` can still reopen it. Returns `(old_tab_id, new_tab_id)`.
+    pub fn reset_last_tab_to_home(&mut self) -> (Option<usize>, usize) {
+        let old = self.tabs.pop();
+        let old_id = old.as_ref().map(|t| t.id);
+        if let Some(removed) = old {
+            if !removed.url.starts_with("rover:start") && !removed.url.starts_with("atlas:start") {
+                self.closed_stack.push(removed);
+                if self.closed_stack.len() > CLOSED_LIMIT {
+                    self.closed_stack.remove(0);
+                }
+            }
+        }
+        self.split_secondary_id = None;
+        self.groups.clear();
+        let new_id = self.open_tab("rover:start", "New tab");
+        (old_id, new_id)
+    }
+
+    /// Closes all unpinned tabs except `keep_index`. Returns the IDs of closed tabs.
+    pub fn close_other_tabs(&mut self, keep_index: usize) -> Vec<usize> {
+        if keep_index >= self.tabs.len() {
+            return Vec::new();
+        }
+        let keep_id = self.tabs[keep_index].id;
+        let mut closed_ids = Vec::new();
+        let mut kept = Vec::with_capacity(self.tabs.len());
+        for t in self.tabs.drain(..) {
+            if t.id == keep_id || t.pinned {
+                kept.push(t);
+            } else {
+                closed_ids.push(t.id);
+                if self.split_secondary_id == Some(t.id) {
+                    self.split_secondary_id = None;
+                }
+                if !t.url.starts_with("rover:start") && !t.url.starts_with("atlas:start") {
+                    self.closed_stack.push(t);
+                    if self.closed_stack.len() > CLOSED_LIMIT {
+                        self.closed_stack.remove(0);
+                    }
+                }
+            }
+        }
+        self.tabs = kept;
+        self.active_index = self
+            .tabs
+            .iter()
+            .position(|t| t.id == keep_id)
+            .unwrap_or(0);
+        self.cleanup_empty_groups();
+        closed_ids
+    }
+
+    // --------------------------------------------------------- Session Persistence
+    pub fn to_session(&self) -> SavedSession {
+        let split_secondary_index = self
+            .split_secondary_id
+            .and_then(|sid| self.tabs.iter().position(|t| t.id == sid));
+        SavedSession {
+            version: 1,
+            tabs: self.tabs.iter().map(SavedTab::from_tab).collect(),
+            active_index: self.active_index.min(self.tabs.len().saturating_sub(1)),
+            groups: self.groups.clone(),
+            closed_tabs: self.closed_stack.iter().map(SavedTab::from_tab).collect(),
+            split_secondary_index,
+            workspaces: self.workspaces.clone(),
+            current_workspace: self.current_workspace.clone(),
+        }
+    }
+
+    pub fn from_session(session: SavedSession) -> Self {
+        let mut strip = Self {
+            tabs: Vec::new(),
+            groups: session.groups,
+            active_index: 0,
+            closed_stack: Vec::new(),
+            split_secondary_id: None,
+            vertical_tabs: false,
+            workspaces: session.workspaces,
+            current_workspace: if session.current_workspace.trim().is_empty() {
+                "Main".into()
+            } else {
+                session.current_workspace
+            },
+            next_tab_id: 1,
+            next_group_id: 1,
+        };
+
+        // Ensure next_tab_id stays higher than any ID stored inside workspaces
+        for ws in strip.workspaces.values() {
+            for t in &ws.tabs {
+                if t.id >= strip.next_tab_id {
+                    strip.next_tab_id = t.id + 1;
+                }
+            }
+        }
+
+        // Ensure next_group_id stays higher than any existing group key ("gN")
+        for gid in strip.groups.keys() {
+            if let Some(num) = gid.strip_prefix('g').and_then(|s| s.parse::<usize>().ok()) {
+                if num >= strip.next_group_id {
+                    strip.next_group_id = num + 1;
+                }
+            }
+        }
+
+        let now = now_ts();
+        for st in session.tabs {
+            let clean_url = st.url.trim();
+            if clean_url.is_empty() || clean_url == "about:blank" {
+                continue;
+            }
+            let id = strip.next_tab_id;
+            strip.next_tab_id += 1;
+            let title = if st.title.trim().is_empty() {
+                if clean_url == "rover:start" {
+                    "New tab".to_string()
+                } else {
+                    clean_url.to_string()
+                }
+            } else {
+                st.title
+            };
+            let group_id = st.group_id.filter(|gid| strip.groups.contains_key(gid));
+            strip.tabs.push(Tab {
+                id,
+                url: clean_url.to_string(),
+                title,
+                pinned: st.pinned,
+                muted: false,
+                audible: false,
+                sleeping: false,
+                loading: false,
+                devtools_open: false,
+                agent_active: false,
+                group_id,
+                last_active: now,
+            });
+        }
+
+        if strip.tabs.is_empty() {
+            strip.open_tab("rover:start", "New tab");
+        } else {
+            strip.active_index = session.active_index.min(strip.tabs.len() - 1);
+            if let Some(sidx) = session.split_secondary_index {
+                if sidx < strip.tabs.len() && sidx != strip.active_index {
+                    strip.split_secondary_id = Some(strip.tabs[sidx].id);
+                }
+            }
+        }
+
+        for ct in session.closed_tabs.into_iter().rev().take(CLOSED_LIMIT).rev() {
+            let clean_url = ct.url.trim();
+            if clean_url.is_empty() || clean_url.starts_with("rover:start") {
+                continue;
+            }
+            let id = strip.next_tab_id;
+            strip.next_tab_id += 1;
+            strip.closed_stack.push(Tab {
+                id,
+                url: clean_url.to_string(),
+                title: if ct.title.trim().is_empty() {
+                    clean_url.to_string()
+                } else {
+                    ct.title
+                },
+                pinned: false,
+                muted: false,
+                audible: false,
+                sleeping: false,
+                loading: false,
+                devtools_open: false,
+                agent_active: false,
+                group_id: None,
+                last_active: now,
+            });
+        }
+
+        strip.cleanup_empty_groups();
+        strip
+    }
 }
+
+fn default_workspace_name() -> String {
+    "Main".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SavedTab {
+    pub url: String,
+    pub title: String,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+impl SavedTab {
+    fn from_tab(t: &Tab) -> Self {
+        Self {
+            url: t.url.clone(),
+            title: t.title.clone(),
+            pinned: t.pinned,
+            group_id: t.group_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SavedSession {
+    #[serde(default)]
+    pub version: u32,
+    pub tabs: Vec<SavedTab>,
+    #[serde(default)]
+    pub active_index: usize,
+    #[serde(default)]
+    pub groups: HashMap<String, TabGroup>,
+    #[serde(default)]
+    pub closed_tabs: Vec<SavedTab>,
+    #[serde(default)]
+    pub split_secondary_index: Option<usize>,
+    #[serde(default)]
+    pub workspaces: HashMap<String, Workspace>,
+    #[serde(default = "default_workspace_name")]
+    pub current_workspace: String,
+}
+
+/// Atomically persists the open tab strip session to `path` (`session.json`).
+pub fn save_session(path: &std::path::Path, strip: &TabStrip) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let session = strip.to_session();
+    let bytes = serde_json::to_vec_pretty(&session)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        if std::fs::rename(&tmp, path).is_ok() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    std::fs::write(path, &bytes)
+}
+
+/// Loads a previously saved tab session from `path` (`session.json`).
+pub fn load_session(path: &std::path::Path) -> Option<SavedSession> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let session: SavedSession = serde_json::from_str(&raw).ok()?;
+    if session.tabs.is_empty() {
+        return None;
+    }
+    Some(session)
+}
+

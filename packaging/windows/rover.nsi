@@ -7,7 +7,7 @@ Unicode true
 
 !define APP_NAME "Rover"
 !define APP_FULL_NAME "Rover Browser"
-!define APP_VERSION "2.0.0"
+!define APP_VERSION "2.0.1"
 !define APP_PUBLISHER "Rover Project"
 !define APP_EXE "rover.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Rover"
@@ -31,7 +31,7 @@ SetCompressor zlib
 
 ; Welcome Page Copy
 !define MUI_WELCOMEPAGE_TITLE "Welcome to Rover ${APP_VERSION} Setup"
-!define MUI_WELCOMEPAGE_TEXT "This wizard will install Rover — a pure Chromium-based browser rebuilt in Rust with a built-in low-token AI agent.$\r$\n$\r$\n• Pure open-source Chromium 156 engine (libcef.dll) with docked DevTools$\r$\n• 120× faster Aho-Corasick ad & tracker blocker (2.00 µs/req)$\r$\n• Up to 86.9% fewer AI tokens via DOM Delta Snapshots & Compact DSL$\r$\n• Hardware-accelerated ChaCha20-Poly1305 AEAD encrypted vaults$\r$\n$\r$\nClick Next to continue."
+!define MUI_WELCOMEPAGE_TEXT "This wizard will install Rover — a pure Chromium-based browser rebuilt in Rust with a built-in low-token AI agent.$\r$\n$\r$\n• Pure open-source Chromium 156 engine (libcef.dll) with docked DevTools$\r$\n• Session tab persistence, live omnibox & search autocomplete$\r$\n• 120× faster Aho-Corasick ad & tracker blocker (2.00 µs/req)$\r$\n• Up to 86.9% fewer AI tokens via DOM Delta Snapshots & Compact DSL$\r$\n$\r$\nClick Next to continue."
 
 ; Finish Page Launch Checkbox
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
@@ -51,14 +51,14 @@ SetCompressor zlib
 
 !insertmacro MUI_LANGUAGE "English"
 
-; PE Version Info for RoverSetup-2.0.0.exe
-VIProductVersion "2.0.0.0"
+; PE Version Info for RoverSetup-2.0.1.exe
+VIProductVersion "2.0.1.0"
 VIAddVersionKey "ProductName" "${APP_FULL_NAME}"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "LegalCopyright" "Copyright (C) 2026 ${APP_PUBLISHER}"
 VIAddVersionKey "FileDescription" "${APP_FULL_NAME} ${APP_VERSION} Installer (Pure Chromium CEF)"
-VIAddVersionKey "FileVersion" "2.0.0.0"
-VIAddVersionKey "ProductVersion" "2.0.0.0"
+VIAddVersionKey "FileVersion" "2.0.1.0"
+VIAddVersionKey "ProductVersion" "2.0.1.0"
 
 Section "Rover Browser Core" SecCore
   SectionIn RO

@@ -180,4 +180,106 @@ fn test_chromium_ui_pelagic_1to1_and_no_edge_branding() {
 
     let about = rover_browser::chromium_ui::render_dialog_html("about", "test-tok", None);
     assert!(about.contains("Chromium 156"));
+    assert!(about.contains("Rover 2.0.1"));
+
+    // Verify top-bar autocomplete hooks & tab context menu
+    assert!(chrome.contains("omni_query"));
+    assert!(chrome.contains("omni_move"));
+    assert!(chrome.contains("omni_submit"));
+    assert!(chrome.contains("roverOmniInline"));
+    assert!(chrome.contains("show_tab_menu"));
+
+    // Verify Settings exposes startup tab persistence & autocomplete toggles
+    let settings = rover_browser::chromium_ui::render_dialog_html("settings", "test-tok", Some("general"));
+    assert!(settings.contains("restore_tabs_on_startup"));
+    assert!(settings.contains("Reopen previous tabs on startup"));
+    assert!(settings.contains("autocomplete"));
 }
+
+#[test]
+fn test_tab_persistence_session_roundtrip_and_single_tab_reset() {
+    use rover_browser::tabs::{load_session, save_session};
+
+    let tmp = TempDir::new().unwrap();
+    let session_path = tmp.path().join("session.json");
+
+    let mut strip = TabStrip::new();
+    strip.tabs[0].url = "https://github.com/Tristar-1120/Rover".into();
+    strip.tabs[0].title = "Rover Repo".into();
+    strip.open_tab("https://doc.rust-lang.org/book/", "The Rust Book");
+    strip.open_tab("https://github.com/rust-lang/rust", "rust-lang/rust");
+    strip.open_tab("https://news.ycombinator.com", "Hacker News");
+    strip.set_pinned(0, true);
+    strip.group_tabs(&[1, 2], "Rust Docs", Some("Orange"));
+    strip.select_index(2);
+    // Close HN so it goes onto closed_stack
+    assert!(strip.close_index(3));
+    assert_eq!(strip.closed_stack.len(), 1);
+
+    save_session(&session_path, &strip).unwrap();
+    let loaded = load_session(&session_path).expect("session.json should load cleanly");
+    let restored = TabStrip::from_session(loaded);
+
+    assert_eq!(restored.tabs.len(), 3);
+    assert_eq!(restored.active_index, 2);
+    assert!(restored.tabs[0].pinned);
+    assert_eq!(restored.tabs[0].url, "https://github.com/Tristar-1120/Rover");
+    assert_eq!(restored.tabs[1].title, "The Rust Book");
+    assert_eq!(restored.tabs[2].url, "https://github.com/rust-lang/rust");
+    assert!(restored.groups.values().any(|g| g.name == "Rust Docs"));
+    assert_eq!(restored.closed_stack.len(), 1);
+    assert_eq!(restored.closed_stack[0].url, "https://news.ycombinator.com");
+
+    // Closing other tabs keeps pinned tabs + target tab
+    let mut strip2 = restored.clone();
+    let closed_ids = strip2.close_other_tabs(1);
+    assert_eq!(closed_ids.len(), 1);
+    assert_eq!(strip2.tabs.len(), 2); // pinned tab 0 + kept tab 1
+
+    // Closing the sole remaining tab resets to rover:start without leaving tabs empty
+    let mut single = TabStrip::new();
+    single.tabs[0].url = "https://example.org".into();
+    single.tabs[0].title = "Example".into();
+    let (old_id, new_id) = single.reset_last_tab_to_home();
+    assert!(old_id.is_some());
+    assert_ne!(old_id.unwrap(), new_id);
+    assert_eq!(single.tabs.len(), 1);
+    assert_eq!(single.tabs[0].url, "rover:start");
+    assert_eq!(single.closed_stack.len(), 1);
+    assert_eq!(single.closed_stack[0].url, "https://example.org");
+}
+
+#[test]
+fn test_opensearch_parser_and_homepage_search_bar_autocomplete() {
+    use rover_browser::omnibox::{parse_opensearch_suggestions, suggest_for_search_bar};
+
+    // Standard OpenSearch tuple format (Google, DuckDuckGo type=list, Bing, Brave, Ecosia)
+    let std_json = r#"["mars", ["mars rover", "mars weather", "mars nasa"]]"#;
+    assert_eq!(
+        parse_opensearch_suggestions(std_json),
+        vec!["mars rover", "mars weather", "mars nasa"]
+    );
+
+    // DuckDuckGo phrase-object fallback format
+    let ddg_obj = r#"[{"phrase":"rust lang"},{"phrase":"rust cargo"}]"#;
+    assert_eq!(
+        parse_opensearch_suggestions(ddg_obj),
+        vec!["rust lang", "rust cargo"]
+    );
+
+    // Homepage search bar suggestions combine live search terms + history/bookmarks
+    let tmp = TempDir::new().unwrap();
+    let store = Store::new(Some(tmp.path().to_path_buf()), None);
+    store.add_bookmark("https://mars.nasa.gov", "NASA Mars", "");
+    let rows = suggest_for_search_bar(&store, "mars", &["mars rover".into(), "mars news".into()]);
+    assert_eq!(rows[0].kind, "search");
+    assert_eq!(rows[0].title, "mars rover");
+    assert_eq!(rows[0].fill_text, "mars rover");
+    assert!(rows.iter().any(|r| r.kind == "bookmark" && r.url == "https://mars.nasa.gov"));
+
+    // Homepage HTML embeds the /api/suggest autocomplete dropdown
+    let html = build_homepage_html(&store, "DuckDuckGo", "https://duckduckgo.com/");
+    assert!(html.contains("/api/suggest"));
+    assert!(html.contains("id=\"ac-list\""));
+}
+

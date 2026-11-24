@@ -265,7 +265,7 @@ pub fn build_homepage_html(store: &Store, engine_name: &str, search_action_url: 
     }
     if cfg.show_search {
         parts.push_str(&format!(
-            r#"<form action="{action}" method="get"><input name="q" placeholder="Search {engine}" autofocus autocomplete="off"></form>"#,
+            r#"<div class="search-wrap"><form id="home-form" action="{action}" method="get"><input id="home-q" name="q" placeholder="Search {engine}" autofocus autocomplete="off"></form><div class="ac-list" id="ac-list" role="listbox"></div></div>"#,
             action = html_escape(search_action_url),
             engine = html_escape(engine_name)
         ));
@@ -295,6 +295,100 @@ t=setTimeout(function(){n=0;m.style.transform='';},1200);if(n>=5)location.href='
     } else {
         ""
     };
+    let search_ac_js = if cfg.show_search {
+        r#"<script>(function(){
+var inp=document.getElementById('home-q'),list=document.getElementById('ac-list'),form=document.getElementById('home-form');
+if(!inp||!list||!form)return;
+var tok=new URLSearchParams(location.search).get('t')||'';
+var items=[],sel=-1,typed='',timer=null,seq=0;
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function hide(){items=[];sel=-1;list.classList.remove('open');list.innerHTML='';}
+function iconFor(k){if(k==='bookmark')return '<span class="ac-ic bm">★</span>';if(k==='history')return '<span class="ac-ic hist">↺</span>';if(k==='visit')return '<span class="ac-ic visit">🌐</span>';return '<span class="ac-ic">🔍</span>';}
+function render(){
+  if(!items.length){hide();return;}
+  list.innerHTML=items.map(function(it,i){
+    var sub=(it.kind==='bookmark'||it.kind==='history')?'<span class="ac-url">'+esc(it.url.replace(/^https?:\/\/(www\.)?/i,''))+'</span>':'';
+    return '<div class="ac-row'+(i===sel?' on':'')+'" data-i="'+i+'">'+iconFor(it.kind)+'<span class="ac-title">'+esc(it.title)+'</span>'+sub+'</div>';
+  }).join('');
+  list.classList.add('open');
+}
+function goItem(it){
+  if(!it||!it.url)return;
+  hide();
+  if(tok&&/^rover:/i.test(it.url)){
+    fetch('/api/cmd?t='+encodeURIComponent(tok),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'navigate',url:it.url})}).catch(function(){});
+  }else{
+    location.href=it.url;
+  }
+}
+function query(q,live){
+  if(!tok)return;
+  var id=++seq;
+  fetch('/api/suggest?t='+encodeURIComponent(tok)+'&mode=search&live='+(live?1:0)+'&q='+encodeURIComponent(q))
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){
+      if(!d||id!==seq||inp.value.trim()!==q)return;
+      if(d.enabled===false){hide();return;}
+      items=d.suggestions||[];
+      if(sel>=items.length)sel=-1;
+      render();
+    }).catch(function(){});
+}
+inp.addEventListener('input',function(){
+  typed=inp.value;sel=-1;
+  var q=typed.trim();
+  clearTimeout(timer);
+  if(!q){hide();return;}
+  query(q,false);
+  timer=setTimeout(function(){query(q,true);},90);
+});
+inp.addEventListener('keydown',function(e){
+  if(e.key==='ArrowDown'){
+    if(!items.length)return;
+    e.preventDefault();
+    sel=(sel+1)>=items.length?-1:sel+1;
+    inp.value=sel>=0?(items[sel].fill_text||items[sel].title):typed;
+    render();
+  }else if(e.key==='ArrowUp'){
+    if(!items.length)return;
+    e.preventDefault();
+    sel=sel<=0?(sel===0?-1:items.length-1):sel-1;
+    inp.value=sel>=0?(items[sel].fill_text||items[sel].title):typed;
+    render();
+  }else if(e.key==='Tab'&&items.length){
+    e.preventDefault();
+    var pick=items[sel>=0?sel:0];
+    inp.value=pick.fill_text||pick.title;
+    typed=inp.value;sel=-1;
+  }else if(e.key==='Escape'){
+    if(items.length){e.preventDefault();inp.value=typed;hide();}
+  }else if(e.key==='Enter'){
+    if(sel>=0&&items[sel]){e.preventDefault();goItem(items[sel]);return;}
+    var v=inp.value.trim();
+    if(/^https?:\/\//i.test(v)){e.preventDefault();location.href=v;}
+    else if(/^rover:/i.test(v)&&tok){e.preventDefault();goItem({url:v});}
+    else if(v&&!/\s/.test(v)&&v.indexOf('.')>0){e.preventDefault();location.href='https://'+v;}
+    else{hide();}
+  }
+});
+list.addEventListener('mousedown',function(e){
+  var row=e.target.closest('.ac-row');
+  if(!row)return;
+  e.preventDefault();
+  var idx=parseInt(row.getAttribute('data-i'),10);
+  if(!isNaN(idx)&&items[idx])goItem(items[idx]);
+});
+list.addEventListener('mousemove',function(e){
+  var row=e.target.closest('.ac-row');
+  if(!row)return;
+  var idx=parseInt(row.getAttribute('data-i'),10);
+  if(!isNaN(idx)&&idx!==sel){sel=idx;render();}
+});
+document.addEventListener('click',function(e){if(!e.target.closest('.search-wrap'))hide();});
+})();</script>"#
+    } else {
+        ""
+    };
 
     format!(
         r#"<!doctype html><meta charset="utf-8"><title>New tab</title>
@@ -310,9 +404,20 @@ h1{{font-weight:600;font-size:46px;letter-spacing:-.5px;margin:0 0 6px;text-shad
 p{{color:#D9A798;margin:0 0 26px}}
 .clock{{font-size:64px;font-weight:300;letter-spacing:-1px;text-shadow:0 2px 14px rgba(0,0,0,.3);color:#FED8B1}}
 .date{{color:#D9A798;margin:0 0 26px}}
-form{{width:min(620px,86vw)}}input{{width:100%;box-sizing:border-box;padding:15px 20px;border-radius:30px;
+.search-wrap{{position:relative;width:min(620px,86vw)}}
+form{{width:100%}}input{{width:100%;box-sizing:border-box;padding:15px 20px;border-radius:30px;
 border:1px solid rgba(253,183,142,.28);background:rgba(54,14,16,.84);color:#FEF0E4;font-size:17px;outline:none;
 backdrop-filter:blur(8px)}}input::placeholder{{color:#C48F81}}input:focus{{border-color:#EF7560;box-shadow:0 0 0 3px #EF756044}}
+.ac-list{{display:none;position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:40;
+background:rgba(32,10,12,.97);border:1px solid rgba(253,183,142,.32);border-radius:16px;padding:6px;
+box-shadow:0 16px 40px rgba(0,0,0,.62);backdrop-filter:blur(12px);max-height:340px;overflow-y:auto}}
+.ac-list.open{{display:block}}
+.ac-row{{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;cursor:pointer;font-size:14.5px;color:#FEF0E4}}
+.ac-row:hover,.ac-row.on{{background:rgba(239,117,96,.22);color:#fff}}
+.ac-ic{{width:18px;text-align:center;flex-shrink:0;font-size:13px;opacity:.88}}
+.ac-ic.bm{{color:#FDB78E}}.ac-ic.hist{{color:#C9A497}}.ac-ic.visit{{color:#FED8B1}}
+.ac-title{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}}
+.ac-url{{color:#C48F81;font-size:12px;max-width:44%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0}}
 .tiles{{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:30px;max-width:720px}}
 .tile{{position:relative;width:104px;border-radius:12px}}.tile:hover{{background:rgba(255,255,255,.08)}}
 .go{{display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 6px 10px;color:inherit;text-decoration:none}}
@@ -330,7 +435,7 @@ background:rgba(54,14,16,.65);text-decoration:none;font-size:13px;border:1px sol
 <div class="bg"></div><div class="dim"></div>
 {parts}
 <a class="customize" href="?rover=customize" title="Change the background, shortcuts and what shows here">✎ Customize</a>
-{clock_js}{logo_js}"#,
+{clock_js}{logo_js}{search_ac_js}"#,
         inset = blur * 2
     )
 }

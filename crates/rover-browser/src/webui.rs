@@ -435,6 +435,12 @@ pub fn render_browser_shell_html() -> String {
 <script>
   const HOME_HTML = atob("{home_b64}");
   const PLAY_HTML = atob("{play_b64}");
+  const SESSION_KEY = 'rover_webui_tabs_v1';
+  function pageHtmlFor(url) {{
+    if (!url || url === 'rover:start') return HOME_HTML;
+    if (url === 'rover:playground' || url === 'pelagic:playground') return PLAY_HTML;
+    return `<!doctype html><html><body style="background:#160708;color:#FEF0E4;font-family:system-ui;padding:36px;max-width:760px;margin:auto"><h2 style="color:#FED8B1">${{esc(url)}}</h2><p style="color:#C9A497;margin-top:10px">In the native Windows desktop Rover app (powered by pure Chromium CEF 156), this tab renders live directly inside Chromium with 2.00 µs Aho-Corasick adblocking and docked DevTools.</p></body></html>`;
+  }}
   let tabs = [{{ title: 'New tab', url: 'rover:start', html: HOME_HTML }}];
   let closedTabs = [];
   let bookmarks = []; // ZERO pre-populated bookmarks (1-to-1 Pelagic)
@@ -442,6 +448,18 @@ pub fn render_browser_shell_html() -> String {
   let active = 0;
   let splitOn = false;
   let heldPrompt = '';
+  try {{
+    const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    if (saved && Array.isArray(saved.tabs) && saved.tabs.length) {{
+      tabs = saved.tabs.map(t => ({{ title: t.title || 'New tab', url: t.url || 'rover:start', html: pageHtmlFor(t.url) }}));
+      active = Math.max(0, Math.min(saved.active || 0, tabs.length - 1));
+    }}
+  }} catch(_) {{}}
+  function saveSession() {{
+    try {{
+      localStorage.setItem(SESSION_KEY, JSON.stringify({{ active, tabs: tabs.map(t => ({{ title: t.title, url: t.url }})) }}));
+    }} catch(_) {{}}
+  }}
 
   function renderTabs() {{
     const el = document.getElementById('tabs');
@@ -478,15 +496,21 @@ pub fn render_browser_shell_html() -> String {
     document.getElementById('omni').value = t.url === 'rover:start' ? '' : t.url;
     document.title = (t.title || 'New tab') + ' — Rover';
     renderTabs();
+    saveSession();
   }}
 
   function openTab(url, title) {{
-    tabs.push({{ title: title || 'New tab', url, html: url === 'rover:playground' ? PLAY_HTML : HOME_HTML }});
+    tabs.push({{ title: title || 'New tab', url, html: pageHtmlFor(url) }});
     selectTab(tabs.length - 1);
   }}
 
   function closeTab(i) {{
-    if (tabs.length <= 1) return;
+    if (tabs.length <= 1) {{
+      if (tabs[0] && tabs[0].url !== 'rover:start') closedTabs.push(tabs[0]);
+      tabs = [{{ title: 'New tab', url: 'rover:start', html: HOME_HTML }}];
+      selectTab(0);
+      return;
+    }}
     closedTabs.push(tabs.splice(i, 1)[0]);
     if (active >= tabs.length) active = tabs.length - 1;
     selectTab(active);
@@ -507,8 +531,7 @@ pub fn render_browser_shell_html() -> String {
       tabs[active] = {{ title: 'Rover Playground', url: 'rover:playground', html: PLAY_HTML }};
     }} else {{
       const u = /^https?:\/\//i.test(v) ? v : (!v.includes(' ') && v.includes('.') ? 'https://' + v : 'https://duckduckgo.com/?q=' + encodeURIComponent(v));
-      tabs[active] = {{ title: u.replace(/^https?:\/\//,'').split('/')[0], url: u,
-        html: `<!doctype html><html><body style="background:#160708;color:#FEF0E4;font-family:system-ui;padding:36px;max-width:760px;margin:auto"><h2 style="color:#FED8B1">${{esc(u)}}</h2><p style="color:#C9A497;margin-top:10px">In the native Windows desktop Rover app (powered by pure Chromium CEF 156), this tab renders live directly inside Chromium with 2.00 µs Aho-Corasick adblocking and docked DevTools.</p></body></html>` }};
+      tabs[active] = {{ title: u.replace(/^https?:\/\//,'').split('/')[0], url: u, html: pageHtmlFor(u) }};
     }}
     selectTab(active);
   }}

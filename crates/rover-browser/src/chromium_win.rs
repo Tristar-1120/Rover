@@ -11,9 +11,12 @@ use crate::homepage::{
     add_shortcut, build_homepage_html, parse_home_action, remove_shortcut, HomepageConfig,
     ROVER_ICON_PNG_BYTES,
 };
-use crate::omnibox::search_url;
+use crate::omnibox::{
+    cached_search_suggestions, fetch_search_suggestions, inline_completion, search_url, suggest,
+    suggest_for_search_bar, OmniboxSuggestion,
+};
 use crate::playground::{is_playground_address, render_playground_html};
-use crate::tabs::TabStrip;
+use crate::tabs::{load_session, save_session, TabStrip};
 use crate::tools::{extract_reader_article, render_reader_html};
 use cef::args::Args;
 use cef::{self, Rect as CefRect, *};
@@ -51,24 +54,38 @@ use std::sync::{
 use tiny_http::{Header, Response, Server};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, CreateSolidBrush};
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, FrameRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetClientRect, LoadCursorW, LoadIconW, MoveWindow, PostMessageW, RegisterClassExW,
+    GetClientRect, IsWindow, LoadCursorW, LoadIconW, MoveWindow, PostMessageW, RegisterClassExW,
     SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_TOPALIGN, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CS_VREDRAW, CW_USEDEFAULT, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MF_CHECKED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_TOPALIGN,
+    WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOVE, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
 const WM_ROVER_EXEC: u32 = WM_APP + 17;
+const WM_ROVER_DESTROY_CHILD: u32 = WM_APP + 18;
+const CS_DROPSHADOW_FLAG: u32 = 0x0002_0000;
 const BASE_CHROME_H: i32 = 84; // 38px tabrow + 44px toolbar + 2px progress
 const BM_BAR_H: i32 = 28;
 const FIND_BAR_H: i32 = 36;
 const PANEL_W: i32 = 400;
 const DEVTOOLS_MIN_H: i32 = 260;
+const OMNI_ROW_H_BASE: i32 = 34;
+const OMNI_PAD_BASE: i32 = 6;
+
+const fn gdi_rgb(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
 
 // CEF EventFlags bitmask
 const EF_SHIFT: u32 = 2;
@@ -340,10 +357,17 @@ enum RoverCmd {
         tab_id: usize,
     },
     TabOpenPopup(String),
+    TabClosedByPage(usize),
     TabHomeAction {
         action: String,
         index: Option<usize>,
     },
+    OmniRemoteReady {
+        gen: u64,
+        query: String,
+        remote: Vec<String>,
+    },
+    OmniPickIndex(usize),
     JsCallback {
         cb_id: u64,
         payload: String,
@@ -442,10 +466,43 @@ enum PendingJsKind {
     ReaderExtract { tab_id: usize, url: String },
 }
 
+struct OmniPopupState {
+    hwnd: isize,
+    visible: bool,
+    typed: String,
+    items: Vec<OmniboxSuggestion>,
+    selected: isize,
+    hover: isize,
+    rect_x: i32,
+    rect_y: i32,
+    rect_w: i32,
+    dpr: f64,
+}
+
+impl Default for OmniPopupState {
+    fn default() -> Self {
+        Self {
+            hwnd: 0,
+            visible: false,
+            typed: String::new(),
+            items: Vec::new(),
+            selected: -1,
+            hover: -1,
+            rect_x: 0,
+            rect_y: 80,
+            rect_w: 500,
+            dpr: 1.0,
+        }
+    }
+}
+
 struct RoverRuntime {
     port: u16,
     token: String,
+    session_path: PathBuf,
     main_hwnd: Mutex<isize>,
+    omni: Mutex<OmniPopupState>,
+    omni_gen: AtomicU64,
     queue: Mutex<VecDeque<RoverCmd>>,
     state: Mutex<BrowserState>,
     net: Mutex<NetFilterState>,
@@ -622,6 +679,8 @@ impl RoverRuntime {
             "profile_dir": st.store.root.display().to_string(),
             "private": st.private,
             "search_engine": st.store.get_str("search_engine").unwrap_or_else(|| "duckduckgo".into()),
+            "restore_tabs_on_startup": st.store.get_bool("restore_tabs_on_startup", true),
+            "autocomplete": st.store.get_bool("autocomplete", true),
             "auto_group_tabs": st.store.get_bool("auto_group_tabs", false),
             "proxy_url": st.store.get_str("proxy_url").unwrap_or_default(),
             "home_show_logo": home_cfg.show_logo,
@@ -901,7 +960,78 @@ impl RoverRuntime {
         );
     }
 
+    fn save_session_now(&self) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let st = self.state.lock();
+        if st.private {
+            return;
+        }
+        let _ = save_session(&self.session_path, &st.strip);
+    }
+
+    fn ensure_tab_browser(&self, tab_id: usize) {
+        let maybe_url = {
+            let mut st = self.state.lock();
+            let entry = st.tab_entries.entry(tab_id).or_default();
+            if entry.browser.is_some() {
+                None
+            } else {
+                st.strip
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .map(|t| t.url.clone())
+            }
+        };
+        if let Some(url) = maybe_url {
+            self.create_tab_browser(tab_id, &url);
+        }
+    }
+
+    fn close_tab_entry(entry: TabBrowserEntry) {
+        if let Some(db) = entry.devtools_browser {
+            if let Some(h) = db.host() {
+                let hwnd = cef_to_win_hwnd(h.window_handle());
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+                h.close_browser(1);
+            }
+        }
+        if let Some(b) = entry.browser {
+            if let Some(h) = b.host() {
+                let hwnd = cef_to_win_hwnd(h.window_handle());
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+                h.close_browser(1);
+            }
+        }
+    }
+
+    fn select_tab_index(&self, idx: usize) {
+        self.hide_omni_popup();
+        let active_id = {
+            let mut st = self.state.lock();
+            st.strip.select_index(idx);
+            st.active_tab().map(|t| t.id)
+        };
+        if let Some(tid) = active_id {
+            self.ensure_tab_browser(tid);
+        }
+        self.layout_windows();
+        self.push_ui_updates();
+        self.save_session_now();
+    }
+
     fn open_new_tab(&self, url: Option<&str>) {
+        self.hide_omni_popup();
         let target = url.unwrap_or("rover:start");
         let title = if target == "rover:start" {
             "New tab"
@@ -917,46 +1047,161 @@ impl RoverRuntime {
         self.create_tab_browser(tab_id, target);
         self.layout_windows();
         self.push_ui_updates();
+        self.save_session_now();
     }
 
     fn close_tab_at(&self, idx: usize) {
-        let (closed_entry, should_exit) = {
+        self.hide_omni_popup();
+        let (closed_entry, reset_new_id, next_active_id) = {
             let mut st = self.state.lock();
             if st.strip.tabs.len() <= 1 {
-                (None, true)
+                let (old_id, new_id) = st.strip.reset_last_tab_to_home();
+                let entry = old_id.and_then(|id| st.tab_entries.remove(&id));
+                st.tab_entries.insert(new_id, TabBrowserEntry::default());
+                (entry, Some(new_id), Some(new_id))
             } else {
                 let tid = st.strip.tabs.get(idx).map(|t| t.id);
                 st.strip.close_index(idx);
                 let entry = tid.and_then(|id| st.tab_entries.remove(&id));
-                (entry, false)
+                let active_id = st.active_tab().map(|t| t.id);
+                (entry, None, active_id)
             }
         };
-        if should_exit {
-            let h = *self.main_hwnd.lock() as HWND;
-            if !h.is_null() {
-                unsafe {
-                    PostMessageW(h, WM_CLOSE, 0, 0);
-                }
-            }
-            return;
-        }
         if let Some(entry) = closed_entry {
-            if let Some(db) = entry.devtools_browser {
-                if let Some(h) = db.host() {
-                    h.close_browser(1);
-                }
-            }
-            if let Some(b) = entry.browser {
-                if let Some(h) = b.host() {
-                    h.close_browser(1);
-                }
-            }
+            Self::close_tab_entry(entry);
+        }
+        if let Some(new_id) = reset_new_id {
+            self.create_tab_browser(new_id, "rover:start");
+        } else if let Some(active_id) = next_active_id {
+            self.ensure_tab_browser(active_id);
         }
         self.layout_windows();
         self.push_ui_updates();
+        self.save_session_now();
+    }
+
+    fn show_tab_menu(&self, idx: usize, client_x: i32, client_y: i32) {
+        let main_hwnd = *self.main_hwnd.lock() as HWND;
+        if main_hwnd.is_null() {
+            return;
+        }
+        let (is_pinned, can_reopen, tab_count) = {
+            let st = self.state.lock();
+            let pinned = st.strip.tabs.get(idx).map(|t| t.pinned).unwrap_or(false);
+            (pinned, !st.strip.closed_stack.is_empty(), st.strip.tabs.len())
+        };
+        let mut pt = POINT {
+            x: client_x,
+            y: client_y,
+        };
+        unsafe {
+            ClientToScreen(main_hwnd, &mut pt);
+            SetForegroundWindow(main_hwnd);
+        }
+        let chosen: u32 = unsafe {
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            let add_item = |id: usize, flags: u32, text: &str| {
+                let w = to_wide(text);
+                AppendMenuW(menu, flags, id, w.as_ptr());
+            };
+            add_item(1, MF_STRING, "Reload tab");
+            add_item(2, MF_STRING, "Duplicate tab");
+            add_item(3, MF_STRING, if is_pinned { "Unpin tab" } else { "Pin tab" });
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            add_item(4, MF_STRING, "Close tab");
+            add_item(
+                5,
+                MF_STRING | if tab_count <= 1 { MF_GRAYED } else { 0 },
+                "Close other tabs",
+            );
+            add_item(
+                6,
+                MF_STRING | if !can_reopen { MF_GRAYED } else { 0 },
+                "Reopen closed tab\tCtrl+Shift+T",
+            );
+            let cmd = TrackPopupMenuEx(
+                menu,
+                TPM_RETURNCMD | TPM_TOPALIGN | TPM_LEFTBUTTON,
+                pt.x,
+                pt.y,
+                main_hwnd,
+                ptr::null(),
+            ) as u32;
+            DestroyMenu(menu);
+            cmd
+        };
+        match chosen {
+            1 => {
+                let b_opt = {
+                    let st = self.state.lock();
+                    st.strip
+                        .tabs
+                        .get(idx)
+                        .and_then(|t| st.tab_entries.get(&t.id))
+                        .and_then(|e| e.browser.clone())
+                };
+                if let Some(b) = b_opt {
+                    b.reload();
+                }
+            }
+            2 => {
+                let dup_info = {
+                    let mut st = self.state.lock();
+                    st.strip.duplicate_tab(idx).map(|nid| {
+                        let url = st
+                            .strip
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == nid)
+                            .map(|t| t.url.clone())
+                            .unwrap_or_else(|| "rover:start".into());
+                        st.tab_entries.insert(nid, TabBrowserEntry::default());
+                        (nid, url)
+                    })
+                };
+                if let Some((nid, url)) = dup_info {
+                    self.create_tab_browser(nid, &url);
+                    self.layout_windows();
+                    self.push_ui_updates();
+                    self.save_session_now();
+                }
+            }
+            3 => {
+                self.state.lock().strip.set_pinned(idx, !is_pinned);
+                self.layout_windows();
+                self.push_ui_updates();
+                self.save_session_now();
+            }
+            4 => self.close_tab_at(idx),
+            5 => {
+                let closed_entries: Vec<TabBrowserEntry> = {
+                    let mut st = self.state.lock();
+                    let ids = st.strip.close_other_tabs(idx);
+                    ids.into_iter()
+                        .filter_map(|id| st.tab_entries.remove(&id))
+                        .collect()
+                };
+                for entry in closed_entries {
+                    Self::close_tab_entry(entry);
+                }
+                let active_id = self.state.lock().active_tab().map(|t| t.id);
+                if let Some(aid) = active_id {
+                    self.ensure_tab_browser(aid);
+                }
+                self.layout_windows();
+                self.push_ui_updates();
+                self.save_session_now();
+            }
+            6 => self.dispatch_menu_id(104),
+            _ => {}
+        }
     }
 
     fn navigate_active(&self, raw: &str) {
+        self.hide_omni_popup();
         let (tab_id, target, browser_opt) = {
             let mut st = self.state.lock();
             let engine = st
@@ -986,6 +1231,284 @@ impl RoverRuntime {
             self.create_tab_browser(tab_id, &target);
         }
         self.push_ui_updates();
+        self.save_session_now();
+    }
+
+    fn exec_chrome_js(&self, js: &str) {
+        let chrome = self.state.lock().chrome_browser.clone();
+        if let Some(c) = chrome {
+            if let Some(f) = c.main_frame() {
+                f.execute_java_script(Some(&CefString::from(js)), None, 0);
+            }
+        }
+    }
+
+    fn show_omni_popup(&self) {
+        let main_hwnd = *self.main_hwnd.lock() as HWND;
+        if main_hwnd.is_null() {
+            return;
+        }
+        let (popup_hwnd, rx, ry, rw, count, dpr) = {
+            let mut om = self.omni.lock();
+            if om.items.is_empty() || om.hwnd == 0 {
+                om.visible = false;
+                let ph = om.hwnd as HWND;
+                drop(om);
+                if !ph.is_null() {
+                    unsafe {
+                        ShowWindow(ph, SW_HIDE);
+                    }
+                }
+                return;
+            }
+            om.visible = true;
+            (
+                om.hwnd as HWND,
+                om.rect_x,
+                om.rect_y,
+                om.rect_w,
+                om.items.len() as i32,
+                om.dpr.max(1.0),
+            )
+        };
+        let row_h = ((OMNI_ROW_H_BASE as f64) * dpr).round() as i32;
+        let pad = ((OMNI_PAD_BASE as f64) * dpr).round() as i32;
+        let pop_h = count.min(10) * row_h + pad * 2;
+        let pop_w = rw.max((280.0 * dpr) as i32);
+        let mut pt = POINT { x: rx, y: ry };
+        unsafe {
+            ClientToScreen(main_hwnd, &mut pt);
+            SetWindowPos(
+                popup_hwnd,
+                HWND_TOPMOST,
+                pt.x,
+                pt.y,
+                pop_w,
+                pop_h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            InvalidateRect(popup_hwnd, ptr::null(), 1);
+        }
+    }
+
+    fn hide_omni_popup(&self) {
+        self.omni_gen.fetch_add(1, Ordering::SeqCst);
+        let popup_hwnd = {
+            let mut om = self.omni.lock();
+            if !om.visible && om.items.is_empty() {
+                return;
+            }
+            om.visible = false;
+            om.items.clear();
+            om.selected = -1;
+            om.hover = -1;
+            om.hwnd as HWND
+        };
+        if !popup_hwnd.is_null() {
+            unsafe {
+                ShowWindow(popup_hwnd, SW_HIDE);
+            }
+        }
+        self.exec_chrome_js("window.roverOmniClosed && window.roverOmniClosed();");
+    }
+
+    fn omni_query(
+        &self,
+        text: String,
+        grew: bool,
+        cursor_at_end: bool,
+        rect: Option<(i32, i32, i32, f64)>,
+    ) {
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            self.hide_omni_popup();
+            return;
+        }
+        let gen = self.omni_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let (ac_enabled, engine, inline, initial_items) = {
+            let st = self.state.lock();
+            let ac = st.store.get_bool("autocomplete", true);
+            let eng = st
+                .store
+                .get_str("search_engine")
+                .unwrap_or_else(|| "duckduckgo".into());
+            let inline = if ac && grew && cursor_at_end {
+                inline_completion(&st.store, &text)
+            } else {
+                None
+            };
+            let cached = if ac {
+                cached_search_suggestions(&eng, &trimmed)
+            } else {
+                Vec::new()
+            };
+            let items = if ac {
+                suggest(&st.store, &trimmed, &cached)
+            } else {
+                Vec::new()
+            };
+            (ac, eng, inline, items)
+        };
+
+        if !ac_enabled {
+            self.hide_omni_popup();
+            return;
+        }
+
+        if let Some(full) = inline {
+            let js = format!(
+                "window.roverOmniInline && window.roverOmniInline({}, {});",
+                serde_json::to_string(&text).unwrap_or_default(),
+                serde_json::to_string(&full).unwrap_or_default()
+            );
+            self.exec_chrome_js(&js);
+        }
+
+        {
+            let mut om = self.omni.lock();
+            om.typed = text.clone();
+            om.items = initial_items;
+            om.selected = -1;
+            om.hover = -1;
+            if let Some((x, y, w, dpr)) = rect {
+                om.rect_x = x;
+                om.rect_y = y;
+                om.rect_w = w;
+                om.dpr = dpr;
+            }
+        }
+        self.show_omni_popup();
+
+        // Fetch live OpenSearch suggestions asynchronously (debounced 85ms, non-blocking)
+        let q_bg = trimmed;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(85));
+            let Some(rt) = GLOBAL_APP.get() else { return };
+            if rt.omni_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let remote = fetch_search_suggestions(&engine, &q_bg);
+            if remote.is_empty() || rt.omni_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            rt.post(RoverCmd::OmniRemoteReady {
+                gen,
+                query: q_bg,
+                remote,
+            });
+        });
+    }
+
+    fn omni_remote_ready(&self, gen: u64, query: String, remote: Vec<String>) {
+        if self.omni_gen.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        let items = {
+            let st = self.state.lock();
+            if !st.store.get_bool("autocomplete", true) {
+                return;
+            }
+            suggest(&st.store, &query, &remote)
+        };
+        {
+            let mut om = self.omni.lock();
+            if !om.visible {
+                return;
+            }
+            om.items = items;
+            if om.selected >= om.items.len() as isize {
+                om.selected = -1;
+            }
+        }
+        self.show_omni_popup();
+    }
+
+    fn omni_move(&self, delta: i32) {
+        let (popup_hwnd, preview_opt) = {
+            let mut om = self.omni.lock();
+            if !om.visible || om.items.is_empty() {
+                return;
+            }
+            let len = om.items.len() as isize;
+            let next = if delta > 0 {
+                if om.selected + 1 >= len {
+                    -1
+                } else {
+                    om.selected + 1
+                }
+            } else if om.selected <= -1 {
+                len - 1
+            } else {
+                om.selected - 1
+            };
+            om.selected = next;
+            om.hover = -1;
+            let preview = if next >= 0 {
+                om.items
+                    .get(next as usize)
+                    .map(|it| {
+                        if it.fill_text.is_empty() {
+                            it.url.clone()
+                        } else {
+                            it.fill_text.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| om.typed.clone())
+            } else {
+                om.typed.clone()
+            };
+            (om.hwnd as HWND, Some(preview))
+        };
+        if !popup_hwnd.is_null() {
+            unsafe {
+                InvalidateRect(popup_hwnd, ptr::null(), 1);
+            }
+        }
+        if let Some(txt) = preview_opt {
+            let js = format!(
+                "window.roverOmniPreview && window.roverOmniPreview({});",
+                serde_json::to_string(&txt).unwrap_or_default()
+            );
+            self.exec_chrome_js(&js);
+        }
+    }
+
+    fn omni_submit(&self, text: &str) {
+        let picked_url = {
+            let om = self.omni.lock();
+            if om.visible && om.selected >= 0 {
+                om.items.get(om.selected as usize).map(|it| it.url.clone())
+            } else {
+                None
+            }
+        };
+        self.hide_omni_popup();
+        if let Some(u) = picked_url {
+            self.navigate_active(&u);
+        } else {
+            self.navigate_active(text);
+        }
+    }
+
+    fn omni_pick_index(&self, idx: usize) {
+        let picked = {
+            let om = self.omni.lock();
+            om.items.get(idx).cloned()
+        };
+        self.hide_omni_popup();
+        if let Some(item) = picked {
+            let shown = if item.url == "rover:start" {
+                String::new()
+            } else {
+                item.url.clone()
+            };
+            let js = format!(
+                "window.roverOmniCommit && window.roverOmniCommit({});",
+                serde_json::to_string(&shown).unwrap_or_default()
+            );
+            self.exec_chrome_js(&js);
+            self.navigate_active(&item.url);
+        }
     }
 
     fn toggle_devtools(&self, inspect_element: bool) {
@@ -1352,12 +1875,14 @@ impl RoverRuntime {
                     self.create_tab_browser(tab_id, &url);
                     self.layout_windows();
                     self.push_ui_updates();
+                    self.save_session_now();
                 }
             }
             105 => self.toggle_split_view(),
             106 => {
                 self.state.lock().strip.group_by_site();
                 self.push_ui_updates();
+                self.save_session_now();
             }
             107 => {
                 let st = self.state.lock();
@@ -1368,9 +1893,17 @@ impl RoverRuntime {
             }
             180..=182 => {
                 let ws = ["Main", "Work", "Research"][(id - 180) as usize];
-                self.state.lock().strip.switch_workspace(ws);
+                let active_id = {
+                    let mut st = self.state.lock();
+                    st.strip.switch_workspace(ws);
+                    st.active_tab().map(|t| t.id)
+                };
+                if let Some(tid) = active_id {
+                    self.ensure_tab_browser(tid);
+                }
                 self.layout_windows();
                 self.push_ui_updates();
+                self.save_session_now();
             }
             110 => self.open_dialog("bookmarks", None),
             111 => self.open_dialog("history", None),
@@ -1469,9 +2002,7 @@ impl RoverRuntime {
             204 => self.open_dialog("settings", Some("privacy")),
             300..=399 => {
                 let idx = (id - 300) as usize;
-                self.state.lock().strip.select_index(idx);
-                self.layout_windows();
-                self.push_ui_updates();
+                self.select_tab_index(idx);
             }
             _ => {}
         }
@@ -1484,16 +2015,22 @@ impl RoverRuntime {
     }
 
     fn toggle_split_view(&self) {
-        let mut st = self.state.lock();
-        if st.strip.split_secondary_id.is_some() {
-            st.strip.end_split();
-        } else if st.strip.tabs.len() >= 2 {
-            let other = if st.strip.active_index == 0 { 1 } else { 0 };
-            st.strip.set_split(other);
+        let split_id = {
+            let mut st = self.state.lock();
+            if st.strip.split_secondary_id.is_some() {
+                st.strip.end_split();
+            } else if st.strip.tabs.len() >= 2 {
+                let other = if st.strip.active_index == 0 { 1 } else { 0 };
+                st.strip.set_split(other);
+            }
+            st.strip.split_secondary_id
+        };
+        if let Some(sid) = split_id {
+            self.ensure_tab_browser(sid);
         }
-        drop(st);
         self.layout_windows();
         self.push_ui_updates();
+        self.save_session_now();
     }
 
     fn toggle_find(&self, show: bool) {
@@ -2155,6 +2692,7 @@ impl RoverRuntime {
                     }
                 }
                 self.push_ui_updates();
+                self.save_session_now();
             }
             RoverCmd::TabTitleChanged { tab_id, title } => {
                 {
@@ -2168,6 +2706,7 @@ impl RoverRuntime {
                     }
                 }
                 self.push_ui_updates();
+                self.save_session_now();
             }
             RoverCmd::TabLoadingChanged {
                 tab_id,
@@ -2242,8 +2781,47 @@ impl RoverRuntime {
                     }
                 }
                 self.push_ui_updates();
+                self.save_session_now();
             }
             RoverCmd::TabOpenPopup(url) => self.open_new_tab(Some(&url)),
+            RoverCmd::TabClosedByPage(tab_id) => {
+                // If a page called window.close() itself, remove it from TabStrip cleanly.
+                let idx_opt = self
+                    .state
+                    .lock()
+                    .strip
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == tab_id);
+                if let Some(idx) = idx_opt {
+                    let reset_new_id = {
+                        let mut st = self.state.lock();
+                        st.tab_entries.remove(&tab_id);
+                        if st.strip.tabs.len() <= 1 {
+                            let (_, new_id) = st.strip.reset_last_tab_to_home();
+                            st.tab_entries.insert(new_id, TabBrowserEntry::default());
+                            Some(new_id)
+                        } else {
+                            st.strip.close_index(idx);
+                            None
+                        }
+                    };
+                    if let Some(nid) = reset_new_id {
+                        self.create_tab_browser(nid, "rover:start");
+                    } else if let Some(aid) = self.state.lock().active_tab().map(|t| t.id) {
+                        self.ensure_tab_browser(aid);
+                    }
+                    self.layout_windows();
+                    self.push_ui_updates();
+                    self.save_session_now();
+                }
+            }
+            RoverCmd::OmniRemoteReady { gen, query, remote } => {
+                self.omni_remote_ready(gen, query, remote);
+            }
+            RoverCmd::OmniPickIndex(idx) => {
+                self.omni_pick_index(idx);
+            }
             RoverCmd::TabHomeAction { action, index } => match action.as_str() {
                 "add" | "edit" => self.open_dialog("shortcut", None),
                 "del" => {
@@ -2338,26 +2916,32 @@ impl RoverRuntime {
                 }
                 "reopen_tab" => self.dispatch_menu_id(104),
                 "next_tab" => {
-                    let mut st = self.state.lock();
-                    let n = st.strip.tabs.len();
-                    if n > 1 {
-                        let next = (st.strip.active_index + 1) % n;
-                        st.strip.select_index(next);
+                    let next = {
+                        let st = self.state.lock();
+                        let n = st.strip.tabs.len();
+                        if n > 1 {
+                            Some((st.strip.active_index + 1) % n)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(i) = next {
+                        self.select_tab_index(i);
                     }
-                    drop(st);
-                    self.layout_windows();
-                    self.push_ui_updates();
                 }
                 "prev_tab" => {
-                    let mut st = self.state.lock();
-                    let n = st.strip.tabs.len();
-                    if n > 1 {
-                        let prev = (st.strip.active_index + n - 1) % n;
-                        st.strip.select_index(prev);
+                    let prev = {
+                        let st = self.state.lock();
+                        let n = st.strip.tabs.len();
+                        if n > 1 {
+                            Some((st.strip.active_index + n - 1) % n)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(i) = prev {
+                        self.select_tab_index(i);
                     }
-                    drop(st);
-                    self.layout_windows();
-                    self.push_ui_updates();
                 }
                 "focus_omni" => {
                     if let Some(c) = self.state.lock().chrome_browser.clone() {
@@ -2393,7 +2977,9 @@ impl RoverRuntime {
                 "bookmark" => self.handle_json_cmd(json!({"cmd": "toggle_bookmark"})),
                 "find" => self.toggle_find(true),
                 "escape" => {
-                    if self.state.lock().find_open {
+                    if self.omni.lock().visible {
+                        self.hide_omni_popup();
+                    } else if self.state.lock().find_open {
                         self.toggle_find(false);
                     }
                 }
@@ -2433,14 +3019,48 @@ impl RoverRuntime {
             }
             "select_tab" => {
                 let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                self.state.lock().strip.select_index(idx);
-                self.layout_windows();
-                self.push_ui_updates();
+                self.select_tab_index(idx);
             }
             "close_tab" => {
                 let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                 self.close_tab_at(idx);
             }
+            "show_tab_menu" => {
+                let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                let x = v.get("x").and_then(|n| n.as_i64()).unwrap_or(100) as i32;
+                let y = v.get("y").and_then(|n| n.as_i64()).unwrap_or(36) as i32;
+                self.show_tab_menu(idx, x, y);
+            }
+            "omni_query" => {
+                let text = v
+                    .get("text")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let grew = v.get("grew").and_then(|b| b.as_bool()).unwrap_or(false);
+                let cursor_at_end = v
+                    .get("cursor_at_end")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(true);
+                let rect = v.get("rect").map(|r| {
+                    (
+                        r.get("x").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
+                        r.get("y").and_then(|n| n.as_i64()).unwrap_or(80) as i32,
+                        r.get("w").and_then(|n| n.as_i64()).unwrap_or(500) as i32,
+                        r.get("dpr").and_then(|n| n.as_f64()).unwrap_or(1.0),
+                    )
+                });
+                self.omni_query(text, grew, cursor_at_end, rect);
+            }
+            "omni_move" => {
+                let delta = v.get("delta").and_then(|n| n.as_i64()).unwrap_or(1) as i32;
+                self.omni_move(delta);
+            }
+            "omni_submit" => {
+                let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("");
+                self.omni_submit(text);
+            }
+            "omni_hide" => self.hide_omni_popup(),
             "navigate" => {
                 if let Some(u) = v.get("url").and_then(|s| s.as_str()) {
                     self.navigate_active(u);
@@ -2838,6 +3458,27 @@ wrap_keyboard_handler! {
     }
 }
 
+fn destroy_child_browser_later(browser: Option<&mut Browser>) {
+    if let Some(b) = browser {
+        if let Some(host) = b.host() {
+            let child = cef_to_win_hwnd(host.window_handle());
+            if !child.is_null() {
+                unsafe {
+                    ShowWindow(child, SW_HIDE);
+                }
+                if let Some(rt) = GLOBAL_APP.get() {
+                    let main_h = *rt.main_hwnd.lock() as HWND;
+                    if !main_h.is_null() && child != main_h {
+                        unsafe {
+                            PostMessageW(main_h, WM_ROVER_DESTROY_CHILD, child as WPARAM, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 enum UiRole {
     Chrome,
@@ -2857,6 +3498,15 @@ wrap_life_span_handler! {
                     UiRole::Chrome => rt.post(RoverCmd::ChromeBrowserCreated(b.clone())),
                     UiRole::Panel => rt.post(RoverCmd::PanelBrowserCreated(b.clone())),
                     UiRole::Dialog(_) => {}
+                }
+            }
+        }
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            match self.role {
+                UiRole::Dialog(_) => 0,
+                UiRole::Chrome | UiRole::Panel => {
+                    destroy_child_browser_later(browser);
+                    1
                 }
             }
         }
@@ -2901,6 +3551,10 @@ wrap_life_span_handler! {
                 });
             }
         }
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            destroy_child_browser_later(browser);
+            1
+        }
     }
 }
 
@@ -2929,6 +3583,19 @@ wrap_life_span_handler! {
                     browser: b.clone(),
                 });
             }
+        }
+
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            // CRITICAL: Returning 0 from DoClose() causes CEF to post WM_CLOSE to the
+            // top-level owner window (main_hwnd), which closes the entire browser.
+            // Destroy ONLY this tab's own child HWND and return 1 so main_hwnd stays open.
+            destroy_child_browser_later(browser);
+            if let Some(rt) = GLOBAL_APP.get() {
+                if !rt.closing.load(Ordering::SeqCst) {
+                    rt.post(RoverCmd::TabClosedByPage(self.tab_id));
+                }
+            }
+            1
         }
 
         fn on_before_popup(
@@ -3174,6 +3841,43 @@ wrap_client! {
 // Loopback Control Server (Internal Only — Never Opens External Browser)
 // ============================================================================
 
+fn build_suggest_payload(rt: &RoverRuntime, q: &str, mode: &str, live: bool) -> String {
+    let (enabled, engine) = {
+        let st = rt.state.lock();
+        (
+            st.store.get_bool("autocomplete", true),
+            st.store
+                .get_str("search_engine")
+                .unwrap_or_else(|| "duckduckgo".into()),
+        )
+    };
+    if !enabled {
+        return json!({ "enabled": false, "inline": null, "suggestions": [] }).to_string();
+    }
+    let remote = if live {
+        fetch_search_suggestions(&engine, q)
+    } else {
+        cached_search_suggestions(&engine, q)
+    };
+    let st = rt.state.lock();
+    let inline = if mode == "search" {
+        None
+    } else {
+        inline_completion(&st.store, q)
+    };
+    let suggestions = if mode == "search" {
+        suggest_for_search_bar(&st.store, q, &remote)
+    } else {
+        suggest(&st.store, q, &remote)
+    };
+    json!({
+        "enabled": true,
+        "inline": inline,
+        "suggestions": suggestions,
+    })
+    .to_string()
+}
+
 fn spawn_control_server(rt: Arc<RoverRuntime>, server: Server) {
     std::thread::spawn(move || {
         let chrome_html = render_chrome_bar_html(&rt.token);
@@ -3201,6 +3905,37 @@ fn spawn_control_server(rt: Arc<RoverRuntime>, server: Server) {
                 let body = rt.build_state_json().to_string();
                 let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
                 let _ = req.respond(Response::from_string(body).with_header(h));
+                continue;
+            }
+
+            if path == "/api/suggest" {
+                let mut q = String::new();
+                let mut mode = "search".to_string();
+                let mut live = false;
+                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                    match k.as_ref() {
+                        "q" => q = v.into_owned(),
+                        "mode" => mode = v.into_owned(),
+                        "live" => live = v.as_ref() == "1" || v.as_ref() == "true",
+                        _ => {}
+                    }
+                }
+                if live {
+                    // Run live OpenSearch HTTP fetch off the control-server loop so /api/cmd never stalls
+                    let rt_bg = rt.clone();
+                    std::thread::spawn(move || {
+                        let body = build_suggest_payload(&rt_bg, &q, &mode, true);
+                        let h =
+                            Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                                .unwrap();
+                        let _ = req.respond(Response::from_string(body).with_header(h));
+                    });
+                } else {
+                    let body = build_suggest_payload(&rt, &q, &mode, false);
+                    let h =
+                        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+                    let _ = req.respond(Response::from_string(body).with_header(h));
+                }
                 continue;
             }
 
@@ -3271,13 +4006,41 @@ unsafe extern "system" fn main_wnd_proc(
             }
             0
         }
+        WM_ROVER_DESTROY_CHILD => {
+            let child = wparam as HWND;
+            if !child.is_null() && child != hwnd && IsWindow(child) != 0 {
+                DestroyWindow(child);
+            }
+            0
+        }
         WM_SIZE => {
             if let Some(rt) = GLOBAL_APP.get() {
+                rt.hide_omni_popup();
                 rt.layout_windows();
             }
             0
         }
+        WM_MOVE => {
+            if let Some(rt) = GLOBAL_APP.get() {
+                rt.hide_omni_popup();
+            }
+            0
+        }
+        WM_ACTIVATE => {
+            if (wparam & 0xFFFF) as u32 == WA_INACTIVE {
+                if let Some(rt) = GLOBAL_APP.get() {
+                    rt.hide_omni_popup();
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CLOSE => {
+            if let Some(rt) = GLOBAL_APP.get() {
+                // Persist all open tabs BEFORE tearing down child browsers
+                rt.save_session_now();
+                rt.closing.store(true, Ordering::SeqCst);
+                rt.hide_omni_popup();
+            }
             DestroyWindow(hwnd);
             0
         }
@@ -3286,6 +4049,244 @@ unsafe extern "system" fn main_wnd_proc(
                 rt.closing.store(true, Ordering::SeqCst);
             }
             quit_message_loop();
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe extern "system" fn omni_popup_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_MOUSEMOVE => {
+            if let Some(rt) = GLOBAL_APP.get() {
+                let y = ((lparam >> 16) as i16) as i32;
+                let mut om = rt.omni.lock();
+                let dpr = om.dpr.max(1.0);
+                let row_h = ((OMNI_ROW_H_BASE as f64) * dpr).round() as i32;
+                let pad = ((OMNI_PAD_BASE as f64) * dpr).round() as i32;
+                let row = if y >= pad && row_h > 0 {
+                    ((y - pad) / row_h) as isize
+                } else {
+                    -1
+                };
+                let next_hover = if row >= 0 && (row as usize) < om.items.len() {
+                    row
+                } else {
+                    -1
+                };
+                if om.hover != next_hover {
+                    om.hover = next_hover;
+                    drop(om);
+                    InvalidateRect(hwnd, ptr::null(), 1);
+                }
+            }
+            0
+        }
+        WM_LBUTTONDOWN => {
+            if let Some(rt) = GLOBAL_APP.get() {
+                let y = ((lparam >> 16) as i16) as i32;
+                let picked = {
+                    let om = rt.omni.lock();
+                    let dpr = om.dpr.max(1.0);
+                    let row_h = ((OMNI_ROW_H_BASE as f64) * dpr).round() as i32;
+                    let pad = ((OMNI_PAD_BASE as f64) * dpr).round() as i32;
+                    let row = if y >= pad && row_h > 0 {
+                        ((y - pad) / row_h) as isize
+                    } else {
+                        -1
+                    };
+                    if row >= 0 && (row as usize) < om.items.len() {
+                        Some(row as usize)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(idx) = picked {
+                    rt.post(RoverCmd::OmniPickIndex(idx));
+                }
+            }
+            0
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !hdc.is_null() {
+                let (items, selected, hover, dpr) = if let Some(rt) = GLOBAL_APP.get() {
+                    let om = rt.omni.lock();
+                    (om.items.clone(), om.selected, om.hover, om.dpr.max(1.0))
+                } else {
+                    (Vec::new(), -1, -1, 1.0)
+                };
+
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                let bg_br = CreateSolidBrush(gdi_rgb(0x20, 0x0A, 0x0C));
+                let border_br = CreateSolidBrush(gdi_rgb(0x69, 0x2A, 0x2E));
+                let sel_br = CreateSolidBrush(gdi_rgb(0x3A, 0x15, 0x18));
+                let acc_br = CreateSolidBrush(gdi_rgb(0xEF, 0x75, 0x60));
+
+                FillRect(hdc, &rc, bg_br);
+
+                let font_face = to_wide("Segoe UI");
+                let title_font = CreateFontW(
+                    -((14.0 * dpr).round() as i32),
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    1, // DEFAULT_CHARSET
+                    0,
+                    0,
+                    5, // CLEARTYPE_QUALITY
+                    0,
+                    font_face.as_ptr(),
+                );
+                let sub_font = CreateFontW(
+                    -((12.0 * dpr).round() as i32),
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    5,
+                    0,
+                    font_face.as_ptr(),
+                );
+
+                let old_obj = SelectObject(hdc, title_font as _);
+                SetBkMode(hdc, TRANSPARENT as i32);
+
+                let row_h = ((OMNI_ROW_H_BASE as f64) * dpr).round() as i32;
+                let pad = ((OMNI_PAD_BASE as f64) * dpr).round() as i32;
+                let icon_w = ((26.0 * dpr).round()) as i32;
+                let lr_pad = ((12.0 * dpr).round()) as i32;
+                let bar_w = ((3.0 * dpr).round() as i32).max(2);
+                let total_w = rc.right - rc.left;
+
+                for (i, item) in items.iter().take(10).enumerate() {
+                    let top = pad + (i as i32) * row_h;
+                    let bot = top + row_h;
+                    let active = (i as isize == selected) || (i as isize == hover);
+                    if active {
+                        let row_rc = RECT {
+                            left: 2,
+                            top,
+                            right: (rc.right - 2).max(2),
+                            bottom: bot,
+                        };
+                        FillRect(hdc, &row_rc, sel_br);
+                        let acc_rc = RECT {
+                            left: 2,
+                            top: top + 3,
+                            right: 2 + bar_w,
+                            bottom: (bot - 3).max(top + 4),
+                        };
+                        FillRect(hdc, &acc_rc, acc_br);
+                    }
+
+                    let (glyph, g_col) = match item.kind.as_str() {
+                        "bookmark" => ("★", gdi_rgb(0xFD, 0xB7, 0x8E)),
+                        "history" => ("↺", gdi_rgb(0xC9, 0xA4, 0x97)),
+                        "visit" | "internal" => ("→", gdi_rgb(0xFE, 0xD8, 0xB1)),
+                        _ => ("›", gdi_rgb(0xEF, 0x75, 0x60)),
+                    };
+
+                    SelectObject(hdc, title_font as _);
+                    SetTextColor(hdc, g_col);
+                    let mut grc = RECT {
+                        left: lr_pad,
+                        top,
+                        right: lr_pad + icon_w,
+                        bottom: bot,
+                    };
+                    let gw = to_wide(glyph);
+                    DrawTextW(
+                        hdc,
+                        gw.as_ptr(),
+                        -1,
+                        &mut grc,
+                        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+
+                    let has_sub = item.kind == "bookmark" || item.kind == "history";
+                    let title_right = if has_sub && total_w > 340 {
+                        rc.right - (total_w * 38 / 100) - lr_pad
+                    } else {
+                        rc.right - lr_pad
+                    };
+
+                    SetTextColor(
+                        hdc,
+                        if active {
+                            gdi_rgb(0xFF, 0xFF, 0xFF)
+                        } else {
+                            gdi_rgb(0xFE, 0xF0, 0xE4)
+                        },
+                    );
+                    let mut trc = RECT {
+                        left: lr_pad + icon_w,
+                        top,
+                        right: title_right.max(lr_pad + icon_w + 40),
+                        bottom: bot,
+                    };
+                    let tw = to_wide(&item.title);
+                    DrawTextW(
+                        hdc,
+                        tw.as_ptr(),
+                        -1,
+                        &mut trc,
+                        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+
+                    if has_sub && total_w > 340 {
+                        SelectObject(hdc, sub_font as _);
+                        SetTextColor(hdc, gdi_rgb(0xC9, 0xA4, 0x97));
+                        let clean_u = item
+                            .url
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_start_matches("www.");
+                        let mut urc = RECT {
+                            left: title_right + 8,
+                            top,
+                            right: rc.right - lr_pad,
+                            bottom: bot,
+                        };
+                        let uw = to_wide(clean_u);
+                        DrawTextW(
+                            hdc,
+                            uw.as_ptr(),
+                            -1,
+                            &mut urc,
+                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                        );
+                    }
+                }
+
+                FrameRect(hdc, &rc, border_br);
+                SelectObject(hdc, old_obj);
+                DeleteObject(title_font as _);
+                DeleteObject(sub_font as _);
+                DeleteObject(bg_br as _);
+                DeleteObject(border_br as _);
+                DeleteObject(sel_br as _);
+                DeleteObject(acc_br as _);
+            }
+            EndPaint(hwnd, &ps);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -3343,6 +4344,7 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
         dirs_data_root().join("profiles").join("default")
     };
     let _ = std::fs::create_dir_all(&profile_root);
+    let session_path = profile_root.join("session.json");
     let store = Store::new(Some(profile_root.clone()), None);
     let proxy_flags = parse_proxy_flags(&store);
 
@@ -3374,26 +4376,50 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
     let token = gen_session_token();
 
     let net_filter = NetFilterState::new(&store);
-    let mut strip = TabStrip::new();
-    let start_logical = initial_url
-        .as_deref()
-        .map(|u| {
-            let eng = store
-                .get_str("search_engine")
-                .unwrap_or_else(|| "duckduckgo".into());
-            normalize_address(u, &eng)
-        })
-        .unwrap_or_else(|| "rover:start".to_string());
-    strip.tabs[0].url = start_logical.clone();
-    strip.tabs[0].title = if start_logical == "rover:start" {
-        "New tab".into()
+
+    // Chrome/Firefox-style Tab Persistence: restore previously open tabs on startup
+    let mut strip = if !private && store.get_bool("restore_tabs_on_startup", true) {
+        load_session(&session_path)
+            .map(TabStrip::from_session)
+            .unwrap_or_else(TabStrip::new)
     } else {
-        start_logical.clone()
+        TabStrip::new()
     };
-    let first_tab_id = strip.tabs[0].id;
+
+    if let Some(ref u) = initial_url {
+        let eng = store
+            .get_str("search_engine")
+            .unwrap_or_else(|| "duckduckgo".into());
+        let target = normalize_address(u, &eng);
+        let title = if target == "rover:start" {
+            "New tab".to_string()
+        } else {
+            target.clone()
+        };
+        if strip.tabs.len() == 1 && strip.tabs[0].url == "rover:start" {
+            strip.tabs[0].url = target;
+            strip.tabs[0].title = title;
+        } else {
+            strip.open_tab(&target, &title);
+        }
+    }
 
     let mut tab_entries = HashMap::new();
-    tab_entries.insert(first_tab_id, TabBrowserEntry::default());
+    for t in &strip.tabs {
+        tab_entries.insert(t.id, TabBrowserEntry::default());
+    }
+    let boot_active = strip
+        .tabs
+        .get(strip.active_index)
+        .map(|t| (t.id, t.url.clone(), t.title.clone()))
+        .unwrap_or_else(|| (strip.tabs[0].id, "rover:start".into(), "New tab".into()));
+    let boot_split = strip.split_secondary_id.and_then(|sid| {
+        strip
+            .tabs
+            .iter()
+            .find(|t| t.id == sid)
+            .map(|t| (t.id, t.url.clone()))
+    });
 
     let panel_open = store.get_bool("panel", true);
     let bm_bar_vis = store.get_bool("bookmarks_bar", true);
@@ -3404,7 +4430,10 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
     let runtime = Arc::new(RoverRuntime {
         port,
         token: token.clone(),
+        session_path,
         main_hwnd: Mutex::new(0),
+        omni: Mutex::new(OmniPopupState::default()),
+        omni_gen: AtomicU64::new(0),
         queue: Mutex::new(VecDeque::new()),
         state: Mutex::new(BrowserState {
             store,
@@ -3485,11 +4514,27 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
         RegisterClassExW(&wc_dlg);
     }
 
-    let initial_title = to_wide(if private {
-        "New tab — Rover — Private"
-    } else {
-        "New tab — Rover"
-    });
+    let omni_class = to_wide("RoverOmniPopup");
+    let wc_omni = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW_FLAG,
+        lpfnWndProc: Some(omni_popup_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinst,
+        hIcon: ptr::null_mut(),
+        hCursor: arrow_cursor,
+        hbrBackground: bg_brush,
+        lpszMenuName: ptr::null(),
+        lpszClassName: omni_class.as_ptr(),
+        hIconSm: ptr::null_mut(),
+    };
+    unsafe {
+        RegisterClassExW(&wc_omni);
+    }
+
+    let win_suffix = if private { "Rover — Private" } else { "Rover" };
+    let initial_title = to_wide(&format!("{} — {win_suffix}", boot_active.2));
     let main_hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -3515,6 +4560,36 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
     *runtime.main_hwnd.lock() = main_hwnd as isize;
     unsafe {
         ShowWindow(main_hwnd, SW_SHOW);
+    }
+
+    // Create the floating non-activating Omnibox autocomplete popup owned by main_hwnd
+    let omni_hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            omni_class.as_ptr(),
+            ptr::null(),
+            WS_POPUP,
+            0,
+            0,
+            400,
+            100,
+            main_hwnd,
+            ptr::null_mut(),
+            hinst,
+            ptr::null(),
+        )
+    };
+    if !omni_hwnd.is_null() {
+        let round: i32 = 2; // DWMWCP_ROUND on Windows 11
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                omni_hwnd,
+                33,
+                (&round as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+        runtime.omni.lock().hwnd = omni_hwnd as isize;
     }
 
     let mut rc: RECT = unsafe { std::mem::zeroed() };
@@ -3576,7 +4651,11 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
         );
     }
 
-    runtime.create_tab_browser(first_tab_id, &start_logical);
+    runtime.create_tab_browser(boot_active.0, &boot_active.1);
+    if let Some((sid, surl)) = boot_split {
+        runtime.create_tab_browser(sid, &surl);
+    }
+    runtime.save_session_now();
 
     run_message_loop();
     shutdown();

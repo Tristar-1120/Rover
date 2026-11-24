@@ -1,5 +1,16 @@
 # Changelog
 
+## Rover 2.0.1 — Tab Closing Fix, Live Autocomplete & Tab Persistence (2026-11-24)
+
+### Bug Fixes
+- **Fixed closing a tab closing the entire browser**: Implemented CEF `LifeSpanHandler::do_close()` across `TabLifeSpanHandler`, `DevToolsLifeSpanHandler`, and `UiLifeSpanHandler` so closing a child tab or DevTools destroys only that child HWND via `WM_ROVER_DESTROY_CHILD` instead of letting CEF post `WM_CLOSE` to the top-level window. Closing the last remaining tab now cleanly resets to a fresh `New tab` (`rover:start`) while remembering the closed page for `Ctrl+Shift+T`.
+- **Fixed top address bar (Omnibox) autocomplete**: Added a dedicated non-activating Win32 floating dropdown (`RoverOmniPopup`, `WS_POPUP | WS_EX_NOACTIVATE`) rendered directly below the address bar (never clipped by the chrome child HWND) with inline URL completion, prefix-ranked bookmark/history matches, live OpenSearch suggestions (DuckDuckGo, Google, Bing, Brave, Ecosia) with prefix caching, and full keyboard/mouse navigation (`ArrowUp`/`ArrowDown`/`Tab`/`Enter`/`Escape`).
+- **Fixed homepage search bar autocomplete**: Wired live OpenSearch + history/bookmark autocomplete dropdowns into the New Tab homepage search box via a non-blocking `/api/suggest` loopback endpoint.
+
+### New Features
+- **Chrome/Firefox-style Tab Persistence (Session Restore)**: Automatically persists all open tabs, active tab index, pinned tabs, tab groups, workspaces, split view, and recently closed tabs atomically to `session.json` in the active profile directory and reopens them automatically on launch (toggleable in **Settings → General → Startup tabs**; disabled for Private windows). Background restored tabs lazy-load on first click for instant startup and minimal RAM.
+- **Native Tab Context Menu**: Right-click any tab for Reload, Duplicate, Pin/Unpin, Close tab, Close other tabs, and Reopen closed tab.
+
 ## Rover 2.0.0 — Full Rust Rebuild & Rebrand (2026-11-22)
 
 ### Complete Rebrand from Pelagic / AtlasBrowser / Wayfinder to Rover
