@@ -1,30 +1,22 @@
-#!/bin/sh
-# Installs (or updates) Pelagic for the current user from the unpacked Linux tarball. No root needed.
-#   ./install.sh            install into ~/.local
-#   ./install.sh --remove   uninstall (your browsing data in ~/.local/share/AtlasBrowser is kept)
-set -e
-here="$(cd "$(dirname "$0")" && pwd)"
-share="${XDG_DATA_HOME:-$HOME/.local/share}"
-app="$HOME/.local/opt/Pelagic"
-bin="$HOME/.local/bin"
-icon="$share/icons/hicolor/256x256/apps/pelagic.png"
-desktop="$share/applications/pelagic.desktop"
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ "$1" = "--remove" ]; then
-    rm -rf "$app"
-    rm -f "$bin/pelagic" "$icon" "$desktop"
-    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$share/applications" || true
-    echo "Pelagic removed."
-    exit 0
+PREFIX="${HOME}/.local"
+BIN_DIR="${PREFIX}/bin"
+APP_DIR="${PREFIX}/share/applications"
+
+if [[ "${1:-}" == "--remove" ]]; then
+  rm -f "${BIN_DIR}/rover" "${APP_DIR}/rover.desktop"
+  echo "Uninstalled Rover from ${PREFIX}."
+  exit 0
 fi
 
-mkdir -p "$app" "$bin" "$(dirname "$icon")" "$(dirname "$desktop")"
-rm -rf "$app"
-cp -R "$here/Pelagic" "$app"
-ln -sf "$app/Pelagic" "$bin/pelagic"
-cp "$here/pelagic.png" "$icon"
-sed "s|^Exec=pelagic|Exec=$bin/pelagic|" "$here/pelagic.desktop" > "$desktop"
-command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$share/applications" || true
-command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$share/icons/hicolor" || true
-echo "Pelagic installed. Open it from your applications menu or run: $bin/pelagic"
-command -v ffmpeg >/dev/null 2>&1 || echo "Tip: install ffmpeg (for example: sudo apt install ffmpeg) for HD and MP3 YouTube downloads."
+mkdir -p "${BIN_DIR}" "${APP_DIR}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+if [[ -f "${REPO_ROOT}/target/release/rover" ]]; then
+  install -m 0755 "${REPO_ROOT}/target/release/rover" "${BIN_DIR}/rover"
+fi
+install -m 0644 "${SCRIPT_DIR}/rover.desktop" "${APP_DIR}/rover.desktop"
+echo "Installed Rover to ${BIN_DIR}/rover"

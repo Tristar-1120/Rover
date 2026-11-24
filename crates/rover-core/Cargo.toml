@@ -1,0 +1,26 @@
+[package]
+name = "rover-core"
+version.workspace = true
+edition.workspace = true
+description = "Rover core storage, profiles, encrypted secretbox, passwords, autofill, memory, and LWW folder sync"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+chacha20poly1305.workspace = true
+scrypt.workspace = true
+rand.workspace = true
+base64.workspace = true
+hex.workspace = true
+regex.workspace = true
+url.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "rover-net"
+version.workspace = true
+edition.workspace = true
+description = "Rover high-speed network filter engine: Aho-Corasick adblock, Pi-hole domain blocklist, safe browsing, proxy, TLS cert pinning, userscripts, and dark mode"
+
+[dependencies]
+rover-core = { path = "../rover-core" }
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+aho-corasick.workspace = true
+url.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+bincode.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

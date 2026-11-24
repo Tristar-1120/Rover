@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Rover">
+  <defs>
+    <clipPath id="rv-circle">
+      <circle cx="64" cy="64" r="62"/>
+    </clipPath>
+    <linearGradient id="rv-mars-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#C83F3A"/>
+      <stop offset="28%" stop-color="#EF7560"/>
+      <stop offset="62%" stop-color="#FDB78E"/>
+      <stop offset="100%" stop-color="#FED8B1"/>
+    </linearGradient>
+    <radialGradient id="rv-eye" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFF5EB"/>
+      <stop offset="65%" stop-color="#FDB78E"/>
+      <stop offset="100%" stop-color="#DA5647"/>
+    </radialGradient>
+  </defs>
+  <g clip-path="url(#rv-circle)">
+    <rect width="128" height="128" fill="url(#rv-mars-bg)"/>
+    <!-- Parody Martian horizon ridge wave (exact inverted Pelagic wave position) -->
+    <path d="M -6 34 Q 26 18 60 34 T 134 32" fill="none" stroke="#B83328" stroke-width="5.2" stroke-linecap="round" opacity="0.88"/>
+    <!-- Mars Rover Silhouette in exact inverted whale color (#47090C) -->
+    <g fill="#47090C">
+      <!-- Dish antenna -->
+      <path d="M 32 54 C 31 61 37 66 44 65 Z"/>
+      <line x1="39" y1="60" x2="43" y2="55" stroke="#47090C" stroke-width="2" stroke-linecap="round"/>
+      <line x1="36" y1="64" x2="39" y2="70" stroke="#47090C" stroke-width="2.5"/>
+      <!-- Rear RTG power pack + main chassis -->
+      <polygon points="22,74 28,64 43,72 43,82 22,74"/>
+      <path d="M 36 74 L 46 70 L 58 70 L 62 74 L 92 74 L 94 84 L 38 86 Z"/>
+      <!-- Camera Mast & Head -->
+      <rect x="78" y="54" width="4.8" height="22" rx="1.5"/>
+      <rect x="74" y="58" width="12.5" height="2.8" rx="1"/>
+      <rect x="73" y="45" width="16" height="10" rx="2.5"/>
+      <circle cx="84.5" cy="49.5" r="2.7" fill="url(#rv-eye)"/>
+      <!-- Robotic sample arm -->
+      <path d="M 92 79 L 100 79 L 105 86 L 111 86" fill="none" stroke="#47090C" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="100" cy="79" r="3"/>
+      <circle cx="105" cy="86" r="2.6"/>
+      <!-- Rocker-bogie suspension -->
+      <path d="M 34 91 L 51 89 L 69 81 L 91 90" fill="none" stroke="#47090C" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 51 89 L 62 96" fill="none" stroke="#47090C" stroke-width="3.8" stroke-linecap="round"/>
+      <!-- 3 Visible Large Mars Wheels with crisp apricot cutouts -->
+      <circle cx="34" cy="101" r="10.5"/>
+      <circle cx="34" cy="101" r="6" fill="#FED8B1"/>
+      <circle cx="34" cy="101" r="2.5" fill="#47090C"/>
+      <circle cx="62" cy="101" r="10.5"/>
+      <circle cx="62" cy="101" r="6" fill="#FED8B1"/>
+      <circle cx="62" cy="101" r="2.5" fill="#47090C"/>
+      <circle cx="91" cy="101" r="10.5"/>
+      <circle cx="91" cy="101" r="6" fill="#FED8B1"/>
+      <circle cx="91" cy="101" r="2.5" fill="#47090C"/>
+    </g>
+  </g>
+</svg>

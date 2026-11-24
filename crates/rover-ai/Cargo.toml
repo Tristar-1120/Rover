@@ -1,0 +1,24 @@
+[package]
+name = "rover-ai"
+version.workspace = true
+edition.workspace = true
+description = "Rover ultra-low-token AI engine: 26+ providers, USD pricing & usage meter, DOM delta token optimizer, Rover Local zero-token interpreter, two-tier watchers, and autonomous browsing agent"
+
+[dependencies]
+rover-core = { path = "../rover-core" }
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ureq.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

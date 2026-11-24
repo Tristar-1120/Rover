@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rover
+GenericName=Web Browser & AI Agent
+Comment=High-speed Rust browser with ultra-low-token autonomous AI agent
+Exec=rover --serve
+Icon=rover
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;text/markdown;
+StartupWMClass=rover

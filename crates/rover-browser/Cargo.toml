@@ -1,0 +1,38 @@
+[package]
+name = "rover-browser"
+version.workspace = true
+edition.workspace = true
+description = "Rover pure Chromium (CEF) desktop browser, tab groups, workspaces, omnibox, homepage, reader mode, playground, and Rover AI agent"
+
+[[bin]]
+name = "rover"
+path = "src/main.rs"
+
+[dependencies]
+rover-core = { path = "../rover-core" }
+rover-net = { path = "../rover-net" }
+rover-ai = { path = "../rover-ai" }
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+tiny_http.workspace = true
+rusqlite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cef = { version = "156.7.0", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
