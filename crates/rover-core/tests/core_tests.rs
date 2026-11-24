@@ -98,7 +98,8 @@ fn test_profiles_shared_settings_and_isolation() {
     root_store.set_api_key("openai", "sk-shared-key-999").unwrap();
     assert_eq!(work_store.api_key("openai", &[]), "sk-shared-key-999");
 
-    // Deferred deletion removes profile directory
+    // Deferred deletion removes profile directory (drop open SQLite store first for Windows)
+    drop(work_store);
     assert!(profiles.remove(&work.id));
     profiles.purge_pending();
     assert!(!profiles.folder(&work.id).exists());

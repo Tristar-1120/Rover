@@ -57,6 +57,12 @@ jobs:
             }
           }
 
+      - name: Cache Chromium 156 CEF SDK
+        uses: actions/cache@v4
+        with:
+          path: C:\cef_cache
+          key: cef-win64-156.0.31
+
       - name: Build rover.exe (Pure Chromium 156 CEF, static CRT)
         shell: pwsh
         env:
@@ -74,7 +80,7 @@ jobs:
         run: |
           $cefRuntime = Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 2 -Filter "cef_windows_x86_64" | Select-Object -First 1 -ExpandProperty FullName
           if ($cefRuntime) { $env:PATH = "$cefRuntime;$env:PATH" }
-          cargo test --workspace --target x86_64-pc-windows-msvc
+          cargo test --release --workspace --target x86_64-pc-windows-msvc
 
       - name: Stage Pure Chromium 156 runtime and build NSIS installer
         shell: pwsh
