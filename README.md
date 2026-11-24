@@ -69,6 +69,6 @@ cargo run --release --bin rover -- --local 'open github then fill Search with ro
 # Launch the interactive Rover Browser & AI Agent UI server (default port 8420)
 cargo run --release --bin rover -- --serve --port 8420
 
-# Cross-compile Windows 64-bit rover.exe + build native NSIS installer dist/RoverSetup-2.0.0.exe
+# Cross-compile Windows 64-bit rover.exe + build native NSIS installer dist/RoverSetup-2.0.2.exe
 ./packaging/windows/build_installer.sh
 ```

@@ -55,14 +55,14 @@ fn main() {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         #[cfg(target_os = "windows")]
         attach_parent_console_if_present();
-        println!("Rover 2.0.1 (Native Rust + Pure Chromium 156 CEF — Inverted Mars Edition)");
+        println!("Rover 2.0.2 (Native Rust + Pure Chromium 156 CEF — Inverted Mars Edition)");
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         #[cfg(target_os = "windows")]
         attach_parent_console_if_present();
         println!(
-            "Rover 2.0.1 — Pure Chromium (CEF) Rust browser & ultra-low-token autonomous AI agent\n\n\
+            "Rover 2.0.2 — Pure Chromium (CEF) Rust browser & ultra-low-token autonomous AI agent\n\n\
              Usage:\n  \
                rover [URL]                    Launch native Rover Chromium Browser\n  \
                rover --private [URL]          Launch Private Window\n  \
@@ -356,7 +356,7 @@ fn serve_ui(preferred_port: u16) {
                 "application/json",
                 serde_json::json!({
                     "app": "Rover",
-                    "version": "2.0.1",
+                    "version": "2.0.2",
                     "theme": "Inverted Mars",
                     "engine": "Rust",
                     "providers": 26,

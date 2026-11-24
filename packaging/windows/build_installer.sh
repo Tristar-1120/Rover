@@ -84,9 +84,9 @@ if ! echo "${IMPORTS}" | grep -qi "libcef.dll"; then
   exit 1
 fi
 
-echo "==> Packaging native Windows installer RoverSetup-2.0.1.exe with NSIS..."
+echo "==> Packaging native Windows installer RoverSetup-2.0.2.exe with NSIS..."
 makensis -V2 "${SCRIPT_DIR}/rover.nsi"
 
-cp -f "${REPO_ROOT}/dist/RoverSetup-2.0.1.exe" "${REPO_ROOT}/../RoverSetup-2.0.1.exe"
-ls -lh "${STAGE_DIR}/rover.exe" "${STAGE_DIR}/libcef.dll" "${REPO_ROOT}/dist/RoverSetup-2.0.1.exe"
-file "${STAGE_DIR}/rover.exe" "${REPO_ROOT}/dist/RoverSetup-2.0.1.exe"
+cp -f "${REPO_ROOT}/dist/RoverSetup-2.0.2.exe" "${REPO_ROOT}/../RoverSetup-2.0.2.exe"
+ls -lh "${STAGE_DIR}/rover.exe" "${STAGE_DIR}/libcef.dll" "${REPO_ROOT}/dist/RoverSetup-2.0.2.exe"
+file "${STAGE_DIR}/rover.exe" "${REPO_ROOT}/dist/RoverSetup-2.0.2.exe"

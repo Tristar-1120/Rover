@@ -554,3 +554,225 @@ pub fn chat_sync(
     }
     Err(last_err)
 }
+
+/// Curated selectable chat models per provider so the model picker always offers
+/// real, working choices immediately before or after a live `/models` refresh.
+pub fn preset_models_for(provider_id: &str) -> Vec<String> {
+    let list: &[&str] = match provider_id {
+        "gemini" => &[
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-3.8-flash",
+        ],
+        "anthropic" => &[
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
+            "claude-3-7-sonnet-latest",
+            "claude-3-5-haiku-latest",
+            "claude-sonnet-5-5",
+        ],
+        "openai" => &[
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+            "o4-mini",
+            "o3-mini",
+        ],
+        "openrouter" => &[
+            "google/gemini-2.5-flash",
+            "anthropic/claude-sonnet-4.5",
+            "openai/gpt-4o-mini",
+            "deepseek/deepseek-chat-v3-0324",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ],
+        "groq" => &[
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "qwen-qwq-32b",
+            "deepseek-r1-distill-llama-70b",
+            "gemma2-9b-it",
+        ],
+        "mistral" => &[
+            "mistral-small-latest",
+            "mistral-medium-latest",
+            "mistral-large-latest",
+            "codestral-latest",
+        ],
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        "xai" => &["grok-3-mini", "grok-3", "grok-2-latest"],
+        "together" => &[
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Qwen/Qwen2.5-72B-Instruct-Turbo",
+            "deepseek-ai/DeepSeek-V3",
+        ],
+        "fireworks" => &[
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "accounts/fireworks/models/deepseek-v3",
+            "accounts/fireworks/models/qwen2p5-72b-instruct",
+        ],
+        "cerebras" => &["llama-3.3-70b", "llama3.1-8b"],
+        "sambanova" => &[
+            "Meta-Llama-3.3-70B-Instruct",
+            "Meta-Llama-3.1-8B-Instruct",
+            "DeepSeek-R1-Distill-Llama-70B",
+        ],
+        "nvidia" => &[
+            "meta/llama-3.3-70b-instruct",
+            "deepseek-ai/deepseek-r1",
+            "qwen/qwen2.5-72b-instruct",
+        ],
+        "perplexity" => &["sonar", "sonar-pro", "sonar-reasoning"],
+        "cohere" => &["command-r-plus", "command-r", "command-a-03-2025"],
+        "huggingface" => &[
+            "Qwen/Qwen2.5-72B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+        ],
+        "github" => &["gpt-4o-mini", "gpt-4o", "Meta-Llama-3.3-70B-Instruct"],
+        "ollama" => &[
+            "llama3.2",
+            "qwen2.5:7b",
+            "deepseek-r1:8b",
+            "gemma3:4b",
+            "mistral",
+        ],
+        "lmstudio" => &["local-model"],
+        _ => &[],
+    };
+    let mut out: Vec<String> = list.iter().map(|s| (*s).to_string()).collect();
+    if let Some(p) = preset_providers().into_iter().find(|p| p.id == provider_id) {
+        if !out.iter().any(|m| m == &p.model) {
+            out.insert(0, p.model);
+        }
+    }
+    out
+}
+
+/// Parses a provider `/models` JSON response into a filtered list of chat model IDs.
+pub fn parse_models_response(kind: ProviderKind, val: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    match kind {
+        ProviderKind::Gemini => {
+            if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let supports_gen = item
+                        .get("supportedGenerationMethods")
+                        .and_then(|m| m.as_array())
+                        .map(|ms| {
+                            ms.iter()
+                                .any(|x| x.as_str() == Some("generateContent"))
+                        })
+                        .unwrap_or(true);
+                    if !supports_gen {
+                        continue;
+                    }
+                    if let Some(raw) = item.get("name").and_then(|n| n.as_str()) {
+                        let clean = raw.strip_prefix("models/").unwrap_or(raw).trim();
+                        if !clean.is_empty()
+                            && !NOT_CHAT_RE.is_match(clean)
+                            && seen.insert(clean.to_string())
+                        {
+                            out.push(clean.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        ProviderKind::Anthropic | ProviderKind::OpenAi => {
+            if let Some(arr) = val.get("data").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(id) = item.get("id").and_then(|n| n.as_str()) {
+                        let clean = id.trim();
+                        if !clean.is_empty()
+                            && !NOT_CHAT_RE.is_match(clean)
+                            && seen.insert(clean.to_string())
+                        {
+                            out.push(clean.to_string());
+                        }
+                    }
+                }
+            } else if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
+                // Ollama `/api/tags` format: { "models": [ { "name": "llama3.2:latest" } ] }
+                for item in arr {
+                    if let Some(name) = item
+                        .get("name")
+                        .or_else(|| item.get("model"))
+                        .and_then(|n| n.as_str())
+                    {
+                        let clean = name.trim();
+                        if !clean.is_empty() && seen.insert(clean.to_string()) {
+                            out.push(clean.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fetches the live model list from a provider's `/models` endpoint (with Ollama `/api/tags` fallback).
+pub fn fetch_models_sync(p: &Provider, api_key: &str) -> Result<Vec<String>, String> {
+    if p.needs_key && api_key.trim().is_empty() {
+        return Err(format!("Add an API key for {} first (click ⚙).", p.name));
+    }
+    let base = p.base_url.trim_end_matches('/');
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent("Rover/2.0")
+        .build();
+
+    let url = match p.kind {
+        ProviderKind::Gemini => format!("{base}/models?key={}&pageSize=100", api_key.trim()),
+        ProviderKind::Anthropic => format!("{base}/models?limit=100"),
+        ProviderKind::OpenAi => format!("{base}/models"),
+    };
+
+    let mut req = agent.get(&url).set("Accept", "application/json");
+    match p.kind {
+        ProviderKind::OpenAi => {
+            if !api_key.trim().is_empty() {
+                req = req.set("Authorization", &format!("Bearer {}", api_key.trim()));
+            }
+        }
+        ProviderKind::Anthropic => {
+            req = req
+                .set("x-api-key", api_key.trim())
+                .set("anthropic-version", "2023-06-01");
+        }
+        ProviderKind::Gemini => {}
+    }
+
+    match req.call() {
+        Ok(resp) => {
+            let val: Value = resp
+                .into_json()
+                .map_err(|e| format!("Invalid model list JSON from {}: {e}", p.name))?;
+            let list = parse_models_response(p.kind, &val);
+            if list.is_empty() {
+                Err(format!("{} returned no chat models.", p.name))
+            } else {
+                Ok(list)
+            }
+        }
+        Err(first_err) => {
+            // Ollama fallback: GET http://127.0.0.1:11434/api/tags
+            if p.id == "ollama" {
+                let root = base.trim_end_matches("/v1");
+                if let Ok(resp) = agent.get(&format!("{root}/api/tags")).call() {
+                    if let Ok(val) = resp.into_json::<Value>() {
+                        let list = parse_models_response(ProviderKind::OpenAi, &val);
+                        if !list.is_empty() {
+                            return Ok(list);
+                        }
+                    }
+                }
+            }
+            Err(format!("Could not fetch models from {}: {first_err}", p.name))
+        }
+    }
+}
+

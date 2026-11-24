@@ -67,11 +67,36 @@ pub struct TabGroup {
     pub collapsed: bool,
 }
 
+pub fn default_favicon_for_url(raw_url: &str) -> String {
+    let t = raw_url.trim();
+    let low = t.to_ascii_lowercase();
+    if t.is_empty()
+        || low.starts_with("rover:")
+        || low.starts_with("atlas:")
+        || low.starts_with("pelagic:")
+    {
+        return "/rover-icon.png".to_string();
+    }
+    if let Ok(u) = Url::parse(t) {
+        if matches!(u.scheme(), "http" | "https") {
+            if let Some(host) = u.host_str() {
+                return match u.port() {
+                    Some(p) => format!("{}://{host}:{p}/favicon.ico", u.scheme()),
+                    None => format!("{}://{host}/favicon.ico", u.scheme()),
+                };
+            }
+        }
+    }
+    String::new()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Tab {
     pub id: usize,
     pub url: String,
     pub title: String,
+    #[serde(default)]
+    pub favicon: String,
     pub pinned: bool,
     pub muted: bool,
     pub audible: bool,
@@ -158,6 +183,7 @@ impl TabStrip {
             id,
             url: clean_url.to_string(),
             title: clean_title.to_string(),
+            favicon: default_favicon_for_url(clean_url),
             pinned: false,
             muted: false,
             audible: false,
@@ -241,6 +267,7 @@ impl TabStrip {
             id: new_id,
             url: src.url,
             title: src.title,
+            favicon: src.favicon,
             pinned: false,
             muted: src.muted,
             audible: false,
@@ -600,10 +627,16 @@ impl TabStrip {
                 st.title
             };
             let group_id = st.group_id.filter(|gid| strip.groups.contains_key(gid));
+            let favicon = if st.favicon.trim().is_empty() {
+                default_favicon_for_url(clean_url)
+            } else {
+                st.favicon
+            };
             strip.tabs.push(Tab {
                 id,
                 url: clean_url.to_string(),
                 title,
+                favicon,
                 pinned: st.pinned,
                 muted: false,
                 audible: false,
@@ -634,6 +667,11 @@ impl TabStrip {
             }
             let id = strip.next_tab_id;
             strip.next_tab_id += 1;
+            let favicon = if ct.favicon.trim().is_empty() {
+                default_favicon_for_url(clean_url)
+            } else {
+                ct.favicon
+            };
             strip.closed_stack.push(Tab {
                 id,
                 url: clean_url.to_string(),
@@ -642,6 +680,7 @@ impl TabStrip {
                 } else {
                     ct.title
                 },
+                favicon,
                 pinned: false,
                 muted: false,
                 audible: false,
@@ -668,6 +707,8 @@ pub struct SavedTab {
     pub url: String,
     pub title: String,
     #[serde(default)]
+    pub favicon: String,
+    #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
     pub group_id: Option<String>,
@@ -678,6 +719,7 @@ impl SavedTab {
         Self {
             url: t.url.clone(),
             title: t.title.clone(),
+            favicon: t.favicon.clone(),
             pinned: t.pinned,
             group_id: t.group_id.clone(),
         }

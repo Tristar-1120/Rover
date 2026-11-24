@@ -1,5 +1,14 @@
 # Changelog
 
+## Rover 2.0.2 — Working Downloads, AI Provider/Model Picker & Tab `.ico` Favicons (2026-11-24)
+
+### Bug Fixes
+- **Fixed Downloads not working**: Implemented CEF `DownloadHandler` (`TabDownloadHandler` with `can_download`, `on_before_download`, and `on_download_updated`) on `TabCefClient` so clicking any download link saves directly to `%USERPROFILE%\Downloads` with collision-free naming (`file (1).ext`). Added a live **Downloads** toolbar button with active/completed badge, `Ctrl+J` shortcut, and a real-time Downloads manager dialog with progress bars, Cancel, Open, Show in folder, Open folder, and Clear completed.
+- **Fixed AI model & provider selection (stopped always using Rover Local)**:
+  - `handle_ai_prompt()` now only routes to **Rover Local** when `"Rover Local (No AI · 0 tokens)"` is explicitly selected as the active provider — selecting Gemini, Claude, OpenAI, Groq, OpenRouter, Ollama, or any other provider always runs the live AI agent with the chosen provider and model.
+  - Replaced the unstable native `<select>` in the Rover AI side panel (which previously collapsed whenever a page state update arrived) with custom Mars-themed searchable **Provider** and **Model** combo pickers, live `/models` fetching (`↻`, supporting Gemini, OpenAI, Anthropic, and Ollama `/api/tags`), curated preset chat models per provider, and an **Active Provider & Model** card in **Settings → AI & API Keys** (`Save & Use` / `Use`).
+- **Fixed tab `.ico` icons not showing**: Implemented CEF `DisplayHandler::on_favicon_urlchange` plus automatic `{scheme}://{host}/favicon.ico` defaults and session persistence for tab favicons, served through a non-blocking cached `/api/favicon` proxy that detects `.ico`, `.png`, `.svg`, `.webp`, `.gif`, and `.jpg` icons cleanly (with an animated loading spinner while navigating and a crisp Mars globe fallback).
+
 ## Rover 2.0.1 — Tab Closing Fix, Live Autocomplete & Tab Persistence (2026-11-24)
 
 ### Bug Fixes

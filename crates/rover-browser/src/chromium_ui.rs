@@ -72,6 +72,13 @@ pub fn render_chrome_bar_html(token: &str) -> String {
   .tab.sleeping {{ opacity:.52; font-style:italic; }}
   .tab-left {{ display:flex; align-items:center; gap:6px; overflow:hidden; min-width:0; }}
   .tab-dot {{ width:7px; height:7px; border-radius:50%; flex-shrink:0; }}
+  .tab-fav {{ width:16px; height:16px; border-radius:3px; flex-shrink:0; object-fit:contain; display:block; }}
+  .tab-spin {{
+    width:14px; height:14px; border-radius:50%; flex-shrink:0;
+    border:2px solid rgba(253,183,142,.25); border-top-color:var(--coral);
+    animation:rvspin .75s linear infinite;
+  }}
+  @keyframes rvspin {{ to {{ transform:rotate(360deg); }} }}
   .tab-title {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
   .tab-x {{
     width:18px; height:18px; border-radius:4px; border:none; background:transparent;
@@ -186,6 +193,10 @@ pub fn render_chrome_bar_html(token: &str) -> String {
            onblur="setTimeout(()=>cmd({{cmd:'omni_hide'}}), 120)">
     <button class="tbtn" id="star-btn" onclick="cmd({{cmd:'toggle_bookmark'}})" title="Bookmark this page (Ctrl+D)">
       <svg viewBox="0 0 20 20"><polygon points="10,2.8 12.2,7.3 17.2,8 13.6,11.5 14.4,16.5 10,14.1 5.6,16.5 6.4,11.5 2.8,8 7.8,7.3"/></svg>
+    </button>
+    <button class="tbtn" id="dl-btn" onclick="cmd({{cmd:'open_dialog',kind:'downloads'}})" title="Downloads (Ctrl+J)">
+      <svg viewBox="0 0 20 20"><line x1="10" y1="3.5" x2="10" y2="13"/><polyline points="6,9.5 10,13.5 14,9.5"/><line x1="4" y1="16.5" x2="16" y2="16.5"/></svg>
+      <span class="badge" id="dl-badge">0</span>
     </button>
     <button class="tbtn" id="ext-btn" onclick="openNativeMenu('extensions', this)" title="Extensions &amp; Ad blocker">
       <svg viewBox="0 0 20 20"><path d="M8 3.5a2 2 0 1 1 4 0h3.5V7a2 2 0 1 1 0 4v4.5H12a2 2 0 1 0-4 0H4.5V11a2 2 0 1 0 0-4V3.5H8z"/></svg>
@@ -331,6 +342,15 @@ pub fn render_chrome_bar_html(token: &str) -> String {
     const f = document.getElementById('find-input');
     f.focus(); f.select();
   }};
+  const FALLBACK_GLOBE = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23C9A497' stroke-width='1.3'%3E%3Ccircle cx='8' cy='8' r='6'/%3E%3Cellipse cx='8' cy='8' rx='2.8' ry='6'/%3E%3Cline x1='2' y1='8' x2='14' y2='8'/%3E%3C/svg%3E";
+  function tabFavSrc(t) {{
+    const f = (t.favicon || '').trim();
+    if (!f || f === '/rover-icon.png' || !t.url || t.url.startsWith('rover:') || t.url.startsWith('atlas:')) {{
+      return '/rover-icon.png';
+    }}
+    if (f.startsWith('data:')) return f;
+    return '/api/favicon?t=' + encodeURIComponent(TOKEN) + '&u=' + encodeURIComponent(f);
+  }}
   window.roverUpdateChrome = (st) => {{
     const tabsEl = document.getElementById('tabs');
     tabsEl.innerHTML = '';
@@ -350,10 +370,13 @@ pub fn render_chrome_bar_html(token: &str) -> String {
       d.onauxclick = (e) => {{ if (e.button === 1) {{ e.preventDefault(); cmd({{ cmd:'close_tab', index: i }}); }} }};
       d.oncontextmenu = (e) => {{ e.preventDefault(); openNativeTabMenu(i, e.clientX, e.clientY); }};
       const dot = t.group_color ? `<span class="tab-dot" style="background:${{t.group_color}}"></span>` : '';
+      const favHtml = t.loading
+        ? `<span class="tab-spin"></span>`
+        : `<img class="tab-fav" src="${{esc(tabFavSrc(t))}}" width="16" height="16" alt="" onerror="this.onerror=null;this.src=FALLBACK_GLOBE">`;
       const title = (t.sleeping ? '☾ ' : '') + (t.title || 'New tab');
       d.innerHTML = t.pinned
-        ? `<span class="tab-title" title="${{esc(title)}}">${{esc(title.slice(0,2))}}</span>`
-        : `<div class="tab-left">${{dot}}<span class="tab-title">${{esc(title)}}</span></div>`
+        ? `<span title="${{esc(title)}}" style="display:flex;align-items:center;justify-content:center">${{favHtml}}</span>`
+        : `<div class="tab-left">${{dot}}${{favHtml}}<span class="tab-title">${{esc(title)}}</span></div>`
           + `<button class="tab-x" onclick="event.stopPropagation();cmd({{cmd:'close_tab',index:${{i}}}})" title="Close tab">✕</button>`;
       tabsEl.appendChild(d);
     }});
@@ -372,6 +395,23 @@ pub fn render_chrome_bar_html(token: &str) -> String {
       ? '<line x1="5" y1="5" x2="15" y2="15"/><line x1="15" y1="5" x2="5" y2="15"/>'
       : '<path d="M15.4 7A6 6 0 1 0 16 11.5"/><polyline points="12.6,3.2 15.6,7.1 11.4,7.4"/>';
     document.getElementById('pbar').style.width = st.loading ? Math.max(8, Math.round((st.progress || 0.1) * 100)) + '%' : '0%';
+
+    const dls = st.downloads || [];
+    const dlActive = dls.filter(x => x.status === 'in_progress').length;
+    const dlBadge = document.getElementById('dl-badge');
+    if (dlBadge) {{
+      if (dlActive > 0) {{
+        dlBadge.textContent = String(dlActive);
+        dlBadge.style.background = '#EF7560';
+        dlBadge.classList.add('show');
+      }} else if (dls.length > 0) {{
+        dlBadge.textContent = '✓';
+        dlBadge.style.background = '#C83F3A';
+        dlBadge.classList.add('show');
+      }} else {{
+        dlBadge.classList.remove('show');
+      }}
+    }}
 
     const badge = document.getElementById('ext-badge');
     const n = st.blocked || 0;
@@ -432,7 +472,7 @@ pub fn render_ai_panel_html(token: &str) -> String {
   .body {{
     flex:1; display:flex; flex-direction:column; gap:6px; padding:8px; min-height:0;
   }}
-  .frow {{ display:flex; align-items:center; gap:6px; }}
+  .frow {{ display:flex; align-items:center; gap:6px; position:relative; }}
   .lbl {{ width:56px; color:var(--muted); font-size:12.5px; flex-shrink:0; }}
   .sel, .inp {{
     flex:1; height:30px; border-radius:8px; padding:0 8px;
@@ -440,6 +480,52 @@ pub fn render_ai_panel_html(token: &str) -> String {
     font-size:13px; outline:none; min-width:0;
   }}
   .sel:focus, .inp:focus {{ border-color:var(--coral); }}
+  .pick-wrap {{ position:relative; flex:1; display:flex; min-width:0; }}
+  .pick-btn {{
+    flex:1; height:30px; border-radius:8px; padding:0 26px 0 9px;
+    background:var(--input); border:1px solid var(--border); color:var(--ink);
+    font-size:13px; text-align:left; cursor:pointer; position:relative;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0;
+  }}
+  .pick-btn:hover, .pick-btn.open {{ border-color:var(--coral); }}
+  .pick-btn::after {{
+    content:'▾'; position:absolute; right:9px; top:50%; transform:translateY(-50%);
+    color:var(--muted); font-size:11px; pointer-events:none;
+  }}
+  .combo-inp {{
+    flex:1; height:30px; border-radius:8px 0 0 8px; padding:0 8px;
+    background:var(--input); border:1px solid var(--border); border-right:none; color:var(--ink);
+    font-size:13px; outline:none; min-width:0; user-select:text;
+  }}
+  .combo-inp:focus {{ border-color:var(--coral); }}
+  .combo-arr {{
+    width:26px; height:30px; border-radius:0 8px 8px 0;
+    background:var(--input); border:1px solid var(--border); border-left:1px solid rgba(253,183,142,.12);
+    color:var(--muted); cursor:pointer; font-size:11px; flex-shrink:0;
+  }}
+  .combo-arr:hover {{ background:var(--btn-hover); color:#fff; }}
+  .pick-menu {{
+    display:none; position:absolute; top:calc(100% + 4px); left:0; right:0; z-index:80;
+    background:#1E090B; border:1px solid var(--border-hi); border-radius:10px;
+    padding:5px; max-height:260px; overflow-y:auto;
+    box-shadow:0 12px 32px rgba(0,0,0,.68);
+  }}
+  .pick-menu.open {{ display:block; }}
+  .pick-search {{
+    width:100%; height:27px; margin-bottom:5px; padding:0 8px; border-radius:6px;
+    background:var(--bg); border:1px solid var(--border); color:var(--ink);
+    font-size:12px; outline:none; user-select:text;
+  }}
+  .pick-search:focus {{ border-color:var(--coral); }}
+  .pick-opt {{
+    display:flex; align-items:center; justify-content:space-between; gap:6px;
+    padding:6px 8px; border-radius:6px; cursor:pointer; font-size:12.5px; color:var(--ink);
+  }}
+  .pick-opt:hover {{ background:var(--btn-hover); color:#fff; }}
+  .pick-opt.on {{ background:var(--crimson); color:#fff; font-weight:600; }}
+  .pick-opt .dot-on {{ color:var(--peach); }}
+  .pick-opt .dot-off {{ color:var(--dim); }}
+  .pick-empty {{ padding:8px; color:var(--dim); font-size:12px; text-align:center; }}
   .mbtn {{
     height:30px; min-width:34px; padding:0 9px; border-radius:8px;
     background:var(--btn); border:1px solid var(--border); color:var(--ink);
@@ -531,13 +617,27 @@ pub fn render_ai_panel_html(token: &str) -> String {
   <div class="body">
     <div class="frow">
       <span class="lbl">Provider</span>
-      <select class="sel" id="provider-sel" onchange="onProviderChange()" title="Which AI service answers. ● = ready to use, ○ = needs an API key (click ⚙)."></select>
+      <div class="pick-wrap" id="provider-wrap">
+        <button class="pick-btn" id="provider-btn" type="button" onclick="toggleProviderMenu(event)" title="Which AI service answers. ● = ready to use, ○ = needs an API key (click ⚙).">○ Google Gemini</button>
+        <div class="pick-menu" id="provider-menu">
+          <input class="pick-search" id="provider-filter" placeholder="Filter providers…" oninput="renderProviderMenu()" onclick="event.stopPropagation()">
+          <div id="provider-opts"></div>
+        </div>
+      </div>
       <button class="mbtn" onclick="cmd({{cmd:'open_dialog',kind:'settings',tab:'ai'}})" title="Add or change API keys">⚙</button>
     </div>
-    <div class="frow">
+    <div class="frow" id="model-row">
       <span class="lbl">Model</span>
-      <input class="inp" id="model-inp" onchange="cmd({{cmd:'set_model',model:this.value}})" title="The model this service uses.">
-      <button class="mbtn" onclick="cmd({{cmd:'refresh_models'}})" title="Get the latest list of models from this service">↻</button>
+      <div class="pick-wrap" id="model-wrap">
+        <input class="combo-inp" id="model-inp" placeholder="Select or type model…" autocomplete="off" spellcheck="false"
+               onfocus="openModelMenu()" oninput="renderModelMenu(this.value)"
+               onkeydown="if(event.key==='Enter'){{commitModel(this.value);closeMenus();this.blur();}}else if(event.key==='Escape'){{closeMenus();}}"
+               onblur="setTimeout(()=>{{if(!modelMenuHover)commitModel(this.value);}}, 160)"
+               title="The model this service uses. Pick from the list or type any model ID.">
+        <button class="combo-arr" type="button" onclick="toggleModelMenu(event)" title="Choose model">▾</button>
+        <div class="pick-menu" id="model-menu"><div id="model-opts"></div></div>
+      </div>
+      <button class="mbtn" id="refresh-models-btn" onclick="cmd({{cmd:'refresh_models'}})" title="Fetch the latest list of models from this service">↻</button>
     </div>
     <div class="core-row">
       <label title="Send your always-on instructions with every request."><input type="checkbox" id="core-on" onchange="cmd({{cmd:'set_core_enabled',enabled:this.checked}})"> Always-on</label>
@@ -595,6 +695,13 @@ pub fn render_ai_panel_html(token: &str) -> String {
   const TOKEN = "{token}";
   let lastMsgCount = -1;
   let lastRawLen = -1;
+  let lastCoreKey = '';
+  let cachedProviders = [];
+  let cachedModels = [];
+  let currentProviderId = 'gemini';
+  let currentModel = '';
+  let modelMenuHover = false;
+
   function cmd(payload) {{
     fetch('/api/cmd?t=' + TOKEN, {{
       method:'POST',
@@ -603,10 +710,102 @@ pub fn render_ai_panel_html(token: &str) -> String {
     }}).catch(()=>{{}});
   }}
   function saveOpt(key, val) {{ cmd({{ cmd:'set_panel_opt', key, val }}); }}
-  function onProviderChange() {{
-    const pid = document.getElementById('provider-sel').value;
+  function closeMenus() {{
+    document.getElementById('provider-menu').classList.remove('open');
+    document.getElementById('provider-btn').classList.remove('open');
+    document.getElementById('model-menu').classList.remove('open');
+  }}
+  function toggleProviderMenu(e) {{
+    e.stopPropagation();
+    const m = document.getElementById('provider-menu');
+    const was = m.classList.contains('open');
+    closeMenus();
+    if (!was) {{
+      const f = document.getElementById('provider-filter');
+      f.value = '';
+      renderProviderMenu();
+      m.classList.add('open');
+      document.getElementById('provider-btn').classList.add('open');
+      setTimeout(() => f.focus(), 10);
+    }}
+  }}
+  function renderProviderMenu() {{
+    const q = (document.getElementById('provider-filter').value || '').trim().toLowerCase();
+    const list = cachedProviders.filter(p => !q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
+    const el = document.getElementById('provider-opts');
+    if (!list.length) {{
+      el.innerHTML = '<div class="pick-empty">No matching providers</div>';
+      return;
+    }}
+    el.innerHTML = list.map(p => {{
+      const on = p.id === currentProviderId ? ' on' : '';
+      const dot = p.configured ? '<span class="dot-on">●</span>' : '<span class="dot-off">○</span>';
+      return `<div class="pick-opt${{on}}" onmousedown="event.preventDefault();pickProvider('${{esc(p.id)}}')"><span>${{dot}} ${{esc(p.name)}}</span></div>`;
+    }}).join('');
+  }}
+  function pickProvider(pid) {{
+    closeMenus();
+    currentProviderId = pid;
+    const found = cachedProviders.find(p => p.id === pid);
+    if (found) {{
+      document.getElementById('provider-btn').textContent = (found.configured ? '● ' : '○ ') + found.name;
+      if (found.model) {{
+        currentModel = found.model;
+        document.getElementById('model-inp').value = found.model;
+      }}
+    }}
     cmd({{ cmd:'set_provider', id: pid }});
   }}
+  function openModelMenu() {{
+    if (currentProviderId === 'local') return;
+    document.getElementById('provider-menu').classList.remove('open');
+    document.getElementById('provider-btn').classList.remove('open');
+    renderModelMenu('');
+    document.getElementById('model-menu').classList.add('open');
+  }}
+  function toggleModelMenu(e) {{
+    e.stopPropagation();
+    if (currentProviderId === 'local') return;
+    const m = document.getElementById('model-menu');
+    const was = m.classList.contains('open');
+    closeMenus();
+    if (!was) {{
+      renderModelMenu('');
+      m.classList.add('open');
+    }}
+  }}
+  function renderModelMenu(filterText) {{
+    const q = (filterText || '').trim().toLowerCase();
+    const list = cachedModels.filter(m => !q || m.toLowerCase().includes(q));
+    const el = document.getElementById('model-opts');
+    if (!list.length) {{
+      el.innerHTML = '<div class="pick-empty">Press Enter to use custom model ID</div>';
+      return;
+    }}
+    el.innerHTML = list.map(m => {{
+      const on = m === currentModel ? ' on' : '';
+      return `<div class="pick-opt${{on}}" onmousedown="event.preventDefault();pickModel('${{esc(m)}}')">${{esc(m)}}</div>`;
+    }}).join('');
+  }}
+  function pickModel(m) {{
+    closeMenus();
+    currentModel = m;
+    document.getElementById('model-inp').value = m;
+    cmd({{ cmd:'set_model', model: m }});
+  }}
+  function commitModel(raw) {{
+    const m = (raw || '').trim();
+    if (m && m !== currentModel && currentProviderId !== 'local') {{
+      currentModel = m;
+      cmd({{ cmd:'set_model', model: m }});
+    }}
+  }}
+  document.getElementById('model-menu').addEventListener('mouseenter', () => modelMenuHover = true);
+  document.getElementById('model-menu').addEventListener('mouseleave', () => modelMenuHover = false);
+  document.addEventListener('click', (e) => {{
+    if (!e.target.closest('#provider-wrap') && !e.target.closest('#model-wrap')) closeMenus();
+  }});
+
   function sendPrompt() {{
     const box = document.getElementById('prompt-box');
     const text = box.value.trim();
@@ -641,26 +840,48 @@ pub fn render_ai_panel_html(token: &str) -> String {
   }}
   window.roverFocusPrompt = () => document.getElementById('prompt-box').focus();
   window.roverUpdatePanel = (st) => {{
-    const ps = document.getElementById('provider-sel');
     if (st.providers && st.providers.length) {{
-      const cur = st.selected_provider || '';
-      ps.innerHTML = st.providers.map(p => `<option value="${{p.id}}"${{p.id===cur?' selected':''}}>${{p.configured?'● ':'○ '}}${{p.name}}</option>`).join('');
+      cachedProviders = st.providers;
+      currentProviderId = st.selected_provider || cachedProviders[0].id;
+      const activeP = cachedProviders.find(p => p.id === currentProviderId) || cachedProviders[0];
+      if (activeP) {{
+        document.getElementById('provider-btn').textContent = (activeP.configured ? '● ' : '○ ') + activeP.name;
+      }}
+      if (document.getElementById('provider-menu').classList.contains('open')) {{
+        renderProviderMenu();
+      }}
     }}
+    cachedModels = st.models || [];
     const mi = document.getElementById('model-inp');
-    if (document.activeElement !== mi && st.selected_model) mi.value = st.selected_model;
+    const isLocal = currentProviderId === 'local';
+    mi.disabled = isLocal;
+    document.getElementById('refresh-models-btn').disabled = isLocal;
+    if (isLocal) {{
+      mi.value = 'Built-in command parser (0 tokens)';
+    }} else if (document.activeElement !== mi && st.selected_model) {{
+      currentModel = st.selected_model;
+      mi.value = st.selected_model;
+    }}
+    if (document.getElementById('model-menu').classList.contains('open')) {{
+      renderModelMenu(document.activeElement === mi ? mi.value : '');
+    }}
 
     const cs = document.getElementById('core-sel');
     const sets = st.core_sets || [];
-    if (sets.length) {{
-      cs.disabled = false;
-      cs.innerHTML = sets.map(s => `<option value="${{esc(s.name)}}"${{s.name===st.core_active?' selected':''}}>${{esc(s.name)}}</option>`).join('');
-      document.getElementById('core-on').disabled = false;
-      document.getElementById('core-on').checked = !!st.core_enabled;
-    }} else {{
-      cs.disabled = true;
-      cs.innerHTML = '<option>No instructions yet: click Edit…</option>';
-      document.getElementById('core-on').disabled = true;
-      document.getElementById('core-on').checked = false;
+    const coreKey = JSON.stringify([sets.map(s=>s.name), st.core_active, st.core_enabled]);
+    if (coreKey !== lastCoreKey && document.activeElement !== cs) {{
+      lastCoreKey = coreKey;
+      if (sets.length) {{
+        cs.disabled = false;
+        cs.innerHTML = sets.map(s => `<option value="${{esc(s.name)}}"${{s.name===st.core_active?' selected':''}}>${{esc(s.name)}}</option>`).join('');
+        document.getElementById('core-on').disabled = false;
+        document.getElementById('core-on').checked = !!st.core_enabled;
+      }} else {{
+        cs.disabled = true;
+        cs.innerHTML = '<option>No instructions yet: click Edit…</option>';
+        document.getElementById('core-on').disabled = true;
+        document.getElementById('core-on').checked = false;
+      }}
     }}
 
     if (st.opts) {{
@@ -781,6 +1002,7 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
     await fetch('/api/cmd?t=' + TOKEN, {{
       method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)
     }});
+    await new Promise(r => setTimeout(r, 70));
     await load();
   }}
   function toast(msg) {{ document.getElementById('toast').textContent = msg; }}
@@ -791,6 +1013,15 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
     STATE = await r.json();
     render();
   }}
+  window.roverUpdateDialog = (st) => {{
+    STATE = st;
+    const ae = document.activeElement;
+    if (KIND === 'downloads') {{
+      render();
+    }} else if (KIND === 'settings' && (!ae || (ae.tagName !== 'INPUT' && ae.tagName !== 'TEXTAREA'))) {{
+      render();
+    }}
+  }};
 
   function render() {{
     const el = document.getElementById('root');
@@ -833,12 +1064,35 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
             <button class="btn-primary" onclick="cmd({{cmd:'set_setting',key:'home_tagline',val:document.getElementById('h-greet').value}});toast('Tagline saved.')">Save</button></div>
         </div>`;
       }} else if (ACTIVE_TAB === 'ai') {{
-        html += `<div class="card"><p class="muted" style="margin-bottom:10px">API keys are encrypted at rest with ChaCha20-Poly1305 AEAD and never sent to web pages.</p>`;
-        (STATE.providers || []).forEach(p => {{
+        const curP = STATE.selected_provider || 'gemini';
+        const curM = STATE.selected_model || '';
+        const models = STATE.models || [];
+        html += `<div class="card">
+          <h2>Active Provider &amp; Model</h2>
+          <div class="row"><label>Active provider</label>
+            <select id="ai-active-prov" onchange="cmd({{cmd:'set_provider',id:this.value}});toast('Switched provider.')">`
+            + (STATE.providers || []).map(p => `<option value="${{esc(p.id)}}"${{p.id===curP?' selected':''}}>${{p.configured?'● ':'○ '}}${{esc(p.name)}}</option>`).join('')
+            + `</select></div>`;
+        if (curP !== 'local') {{
+          html += `<div class="row"><label>Active model</label>
+            <select id="ai-active-model" onchange="if(this.value)cmd({{cmd:'set_model',model:this.value}}),toast('Model updated.')">`
+            + (models.length ? models : [curM]).filter(Boolean).map(m => `<option value="${{esc(m)}}"${{m===curM?' selected':''}}>${{esc(m)}}</option>`).join('')
+            + `</select>
+            <button class="btn" onclick="cmd({{cmd:'refresh_models'}});toast('Fetching models…');setTimeout(load, 1200)">↻ Fetch</button></div>
+          <div class="row"><label>Custom model ID</label>
+            <input type="text" id="ai-custom-model" value="${{esc(curM)}}" placeholder="Or type any custom model ID">
+            <button class="btn-primary" onclick="const m=document.getElementById('ai-custom-model').value.trim();if(m){{cmd({{cmd:'set_model',model:m}});toast('Saved model '+m);}}">Set</button></div>`;
+        }} else {{
+          html += `<p class="muted">Rover Local runs zero-token built-in browser commands without calling an AI model. Choose an AI provider above to chat with an LLM.</p>`;
+        }}
+        html += `</div><div class="card"><h2>API Keys</h2><p class="muted" style="margin-bottom:10px">API keys are encrypted at rest with ChaCha20-Poly1305 AEAD and never sent to web pages.</p>`;
+        (STATE.providers || []).filter(p => p.id !== 'local').forEach(p => {{
+          const isActive = p.id === curP;
           html += `<div class="row">
-            <label style="min-width:170px">${{p.configured?'● ':'○ '}}${{esc(p.name)}}</label>
+            <label style="min-width:170px">${{p.configured?'● ':'○ '}}${{esc(p.name)}}${{isActive?' <span style="color:var(--peach)">(active)</span>':''}}</label>
             <input type="password" id="k-${{p.id}}" placeholder="${{p.configured?'•••••••• (saved)':'Paste API key…'}}">
-            <button class="btn-primary" onclick="saveKey('${{p.id}}')">Save</button>
+            <button class="btn-primary" onclick="saveKey('${{p.id}}')">Save &amp; Use</button>
+            <button class="btn" onclick="cmd({{cmd:'set_provider',id:'${{p.id}}'}});toast('Switched to ${{esc(p.name)}}.')">Use</button>
           </div>`;
         }});
         html += `</div>`;
@@ -883,6 +1137,46 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
         + (items.length ? items.map(r => `<div class="list-item"><div><a class="link" onclick="cmd({{cmd:'open_url_tab',url:'${{esc(r.url)}}'}})">${{esc(r.title||r.url)}}</a><div class="muted">${{esc(r.url)}}</div></div><button class="btn" onclick="cmd({{cmd:'remove_reading_list',url:'${{esc(r.url)}}'}})">Remove</button></div>`).join('')
           : `<div class="empty">Your reading list is empty. Press Alt+Shift+R on any page to save it for later.</div>`)
         + `</div>`;
+    }} else if (KIND === 'downloads') {{
+      const items = STATE.downloads || [];
+      const fmtBytes = (n) => {{
+        if (!n || n <= 0) return '0 B';
+        if (n < 1024) return n + ' B';
+        if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+        if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+        return (n / 1073741824).toFixed(2) + ' GB';
+      }};
+      el.innerHTML = `<h1>Downloads</h1>
+        <div style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span class="muted">Saved to: <code>${{esc(STATE.downloads_dir||'Downloads')}}</code></span>
+          <div style="display:flex;gap:6px">
+            <button class="btn" onclick="cmd({{cmd:'open_downloads_folder'}})">Open folder</button>
+            <button class="btn" onclick="cmd({{cmd:'clear_downloads'}});toast('Cleared finished downloads.')">Clear completed</button>
+          </div>
+        </div>
+        <div class="card">`
+        + (items.length ? items.map((d, idx) => {{
+            const pct = d.status === 'complete' ? 100 : Math.max(0, Math.min(100, d.percent || 0));
+            const sizeTxt = d.total_bytes > 0 ? `${{fmtBytes(d.received_bytes)}} / ${{fmtBytes(d.total_bytes)}}` : fmtBytes(d.received_bytes);
+            const stTxt = d.status === 'complete' ? 'Completed' : (d.status === 'in_progress' ? `Downloading (${{pct}}%)…` : (d.status === 'canceled' ? 'Canceled' : 'Interrupted'));
+            const bar = d.status === 'in_progress'
+              ? `<div style="height:5px;border-radius:3px;background:var(--bg);margin-top:6px;overflow:hidden"><div style="height:100%;width:${{pct}}%;background:var(--coral);transition:width .2s"></div></div>`
+              : '';
+            const btns = d.status === 'in_progress'
+              ? `<button class="btn" onclick="cmd({{cmd:'cancel_download',id:${{d.id}}}})">Cancel</button>`
+              : (d.status === 'complete'
+                  ? `<button class="btn-primary" onclick="openDl(${{idx}})">Open</button><button class="btn" onclick="showDlFolder(${{idx}})">Show in folder</button>`
+                  : '');
+            return `<div class="list-item"><div style="flex:1;min-width:0"><strong style="word-break:break-all">${{esc(d.filename||'download')}}</strong><div class="muted">${{stTxt}} · ${{sizeTxt}}</div>${{bar}}</div><div style="display:flex;gap:6px;flex-shrink:0">${{btns}}</div></div>`;
+          }}).join('')
+          : `<div class="empty">No downloads yet. Any file you download will save directly to your Downloads folder and appear here.</div>`)
+        + `</div>`;
+      if (items.some(d => d.status === 'in_progress') && !window.__dlPoll) {{
+        window.__dlPoll = setInterval(load, 800);
+      }} else if (!items.some(d => d.status === 'in_progress') && window.__dlPoll) {{
+        clearInterval(window.__dlPoll);
+        window.__dlPoll = null;
+      }}
     }} else if (KIND === 'shortcut') {{
       el.innerHTML = `<h1>Add shortcut</h1><div class="card">
         <div class="row"><label>Name</label><input type="text" id="sc-name" placeholder="Example"></div>
@@ -907,8 +1201,8 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
         <p><strong>${{esc(STATE.usage_text||'Session: 0 in · 0 out · $0.0000')}}</strong></p>
         <p class="muted" style="margin-top:8px">Rover's Rust Token Optimizer (DOM Delta Snapshots + Compact DSL + Semantic Pruner + Anthropic/OpenAI Prompt Caching) reduces multi-step agent token volume by up to 86.9%.</p>
       </div>`;
-    }} else if (KIND === 'passwords' || KIND === 'autofill' || KIND === 'automations' || KIND === 'downloads') {{
-      const titles = {{ passwords:'Passwords', autofill:'Addresses and cards', automations:'Automations', downloads:'Downloads' }};
+    }} else if (KIND === 'passwords' || KIND === 'autofill' || KIND === 'automations') {{
+      const titles = {{ passwords:'Passwords', autofill:'Addresses and cards', automations:'Automations' }};
       el.innerHTML = `<h1>${{titles[KIND]||KIND}}</h1><div class="card">
         <p>Protected by Rover's ChaCha20-Poly1305 AEAD vault (<code>RV2</code>) and local SQLite WAL profile storage.</p>
         <p class="muted" style="margin-top:8px">No entries saved yet.</p>
@@ -916,7 +1210,7 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
     }} else {{
       el.innerHTML = `<h1><img src="${{ICON}}" width="34" height="34" style="border-radius:50%"> About Rover</h1>
         <div class="card">
-          <p><strong>Rover 2.0.1</strong> — a pure open-source <strong>Chromium (CEF 156)</strong> browser rebuilt in Rust with an integrated low-token AI agent.</p>
+          <p><strong>Rover 2.0.2</strong> — a pure open-source <strong>Chromium (CEF 156)</strong> browser rebuilt in Rust with an integrated low-token AI agent.</p>
           <p class="muted" style="margin-top:10px">• Engine: Pure Chromium 156 (libcef.dll) — zero Microsoft Edge / WebView2.<br>
           • Speed: 2.00 µs Aho-Corasick adblock · 2.0M lines/sec Pi-hole parser · ChaCha20-Poly1305 AEAD.<br>
           • Token Efficiency: DOM Delta Snapshots · Compact DSL · Semantic Pruner · Zero-token Rover Local.<br>
@@ -928,8 +1222,16 @@ pub fn render_dialog_html(kind: &str, token: &str, param: Option<&str>) -> Strin
   async function saveKey(pid) {{
     const v = document.getElementById('k-' + pid).value.trim();
     if (!v) return;
-    await cmd({{ cmd:'set_api_key', id: pid, key: v }});
-    toast('Saved encrypted API key for ' + pid + '.');
+    await cmd({{ cmd:'set_api_key', id: pid, key: v, activate: true }});
+    toast('Saved encrypted API key and activated ' + pid + '.');
+  }}
+  function openDl(idx) {{
+    const d = (STATE && STATE.downloads || [])[idx];
+    if (d && d.full_path) cmd({{ cmd:'open_download', path: d.full_path }});
+  }}
+  function showDlFolder(idx) {{
+    const d = (STATE && STATE.downloads || [])[idx];
+    if (d && d.full_path) cmd({{ cmd:'show_download_folder', path: d.full_path }});
   }}
   async function addSc() {{
     const name = document.getElementById('sc-name').value.trim();

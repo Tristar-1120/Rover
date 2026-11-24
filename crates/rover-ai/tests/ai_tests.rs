@@ -416,3 +416,57 @@ fn test_localai_watchers_and_provider_payloads() {
         "low"
     );
 }
+
+#[test]
+fn test_preset_models_and_models_response_parsers() {
+    use rover_ai::providers::{parse_models_response, preset_models_for, ProviderKind};
+
+    let gem_models = preset_models_for("gemini");
+    assert_eq!(gem_models[0], "gemini-2.5-flash");
+    assert!(gem_models.iter().any(|m| m == "gemini-2.5-pro"));
+
+    let anth_models = preset_models_for("anthropic");
+    assert_eq!(anth_models[0], "claude-sonnet-4-5");
+
+    let oa_models = preset_models_for("openai");
+    assert!(oa_models.iter().any(|m| m == "gpt-4o-mini"));
+
+    // Gemini /v1beta/models parser strips models/ prefix and filters out embedding/non-generateContent models
+    let gem_resp = json!({
+        "models": [
+            {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
+            {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]}
+        ]
+    });
+    assert_eq!(
+        parse_models_response(ProviderKind::Gemini, &gem_resp),
+        vec!["gemini-2.5-flash", "gemini-2.5-pro"]
+    );
+
+    // OpenAI / Anthropic /models parser filters out non-chat models
+    let oa_resp = json!({
+        "data": [
+            {"id": "gpt-4o-mini"},
+            {"id": "whisper-1"},
+            {"id": "text-embedding-3-small"},
+            {"id": "gpt-4.1"}
+        ]
+    });
+    assert_eq!(
+        parse_models_response(ProviderKind::OpenAi, &oa_resp),
+        vec!["gpt-4o-mini", "gpt-4.1"]
+    );
+
+    // Ollama /api/tags fallback format
+    let ollama_resp = json!({
+        "models": [
+            {"name": "llama3.2:latest"},
+            {"name": "qwen2.5:7b"}
+        ]
+    });
+    assert_eq!(
+        parse_models_response(ProviderKind::OpenAi, &ollama_resp),
+        vec!["llama3.2:latest", "qwen2.5:7b"]
+    );
+}

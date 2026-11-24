@@ -18,15 +18,34 @@ fn main() {
 
         if target_env == "msvc" {
             let res_file = out_dir.join("rover_res.res");
-            let status = Command::new("llvm-rc")
-                .arg("/I")
-                .arg(&rc_dir)
-                .arg("/FO")
-                .arg(&res_file)
-                .arg(&rc_file)
-                .status()
-                .expect("Failed to execute llvm-rc");
-            assert!(status.success(), "llvm-rc exited with error");
+            let rc_candidates: &[&str] = if cfg!(target_os = "windows") {
+                &["rc", "rc.exe", "llvm-rc"]
+            } else {
+                &["llvm-rc", "rc"]
+            };
+            let mut ran = false;
+            for tool in rc_candidates {
+                match Command::new(tool)
+                    .arg("/I")
+                    .arg(&rc_dir)
+                    .arg("/FO")
+                    .arg(&res_file)
+                    .arg(&rc_file)
+                    .status()
+                {
+                    Ok(status) => {
+                        assert!(status.success(), "{tool} exited with error");
+                        ran = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => panic!("Failed to execute {tool}: {e}"),
+                }
+            }
+            assert!(
+                ran,
+                "Neither rc.exe nor llvm-rc was found in PATH to compile rover.rc"
+            );
             println!("cargo:rustc-link-arg={}", res_file.display());
         } else {
             let res_obj = out_dir.join("rover_res.o");

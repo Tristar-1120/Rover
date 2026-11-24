@@ -180,25 +180,59 @@ fn test_chromium_ui_pelagic_1to1_and_no_edge_branding() {
 
     let about = rover_browser::chromium_ui::render_dialog_html("about", "test-tok", None);
     assert!(about.contains("Chromium 156"));
-    assert!(about.contains("Rover 2.0.1"));
+    assert!(about.contains("Rover 2.0.2"));
 
-    // Verify top-bar autocomplete hooks & tab context menu
+    // Verify top-bar autocomplete hooks, tab context menu, downloads button, and tab favicons
     assert!(chrome.contains("omni_query"));
     assert!(chrome.contains("omni_move"));
     assert!(chrome.contains("omni_submit"));
     assert!(chrome.contains("roverOmniInline"));
     assert!(chrome.contains("show_tab_menu"));
+    assert!(chrome.contains("id=\"dl-btn\""));
+    assert!(chrome.contains("id=\"dl-badge\""));
+    assert!(chrome.contains("class=\"tab-fav\""));
+    assert!(chrome.contains("/api/favicon?t="));
 
-    // Verify Settings exposes startup tab persistence & autocomplete toggles
+    // Verify AI panel custom searchable provider & model pickers (no collapsing select)
+    assert!(panel.contains("id=\"provider-btn\""));
+    assert!(panel.contains("id=\"provider-filter\""));
+    assert!(panel.contains("id=\"model-inp\""));
+    assert!(panel.contains("id=\"model-menu\""));
+    assert!(panel.contains("id=\"refresh-models-btn\""));
+
+    // Verify Settings exposes startup tab persistence, autocomplete, and Active Provider & Model
     let settings = rover_browser::chromium_ui::render_dialog_html("settings", "test-tok", Some("general"));
     assert!(settings.contains("restore_tabs_on_startup"));
     assert!(settings.contains("Reopen previous tabs on startup"));
     assert!(settings.contains("autocomplete"));
+    assert!(settings.contains("Active Provider &amp; Model"));
+    assert!(settings.contains("ai-active-prov"));
+    assert!(settings.contains("ai-active-model"));
+    assert!(settings.contains("activate: true"));
+
+    // Verify Downloads dialog exposes real live controls
+    let downloads = rover_browser::chromium_ui::render_dialog_html("downloads", "test-tok", None);
+    assert!(downloads.contains("open_downloads_folder"));
+    assert!(downloads.contains("clear_downloads"));
+    assert!(downloads.contains("cancel_download"));
+    assert!(downloads.contains("show_download_folder"));
+    assert!(downloads.contains("open_download"));
 }
 
 #[test]
 fn test_tab_persistence_session_roundtrip_and_single_tab_reset() {
-    use rover_browser::tabs::{load_session, save_session};
+    use rover_browser::tabs::{default_favicon_for_url, load_session, save_session};
+
+    assert_eq!(default_favicon_for_url("rover:start"), "/rover-icon.png");
+    assert_eq!(default_favicon_for_url(""), "/rover-icon.png");
+    assert_eq!(
+        default_favicon_for_url("https://github.com/Tristar-1120/Rover"),
+        "https://github.com/favicon.ico"
+    );
+    assert_eq!(
+        default_favicon_for_url("http://localhost:8080/dashboard"),
+        "http://localhost:8080/favicon.ico"
+    );
 
     let tmp = TempDir::new().unwrap();
     let session_path = tmp.path().join("session.json");
@@ -206,6 +240,7 @@ fn test_tab_persistence_session_roundtrip_and_single_tab_reset() {
     let mut strip = TabStrip::new();
     strip.tabs[0].url = "https://github.com/Tristar-1120/Rover".into();
     strip.tabs[0].title = "Rover Repo".into();
+    strip.tabs[0].favicon = "https://github.githubassets.com/favicons/favicon.svg".into();
     strip.open_tab("https://doc.rust-lang.org/book/", "The Rust Book");
     strip.open_tab("https://github.com/rust-lang/rust", "rust-lang/rust");
     strip.open_tab("https://news.ycombinator.com", "Hacker News");
@@ -224,7 +259,15 @@ fn test_tab_persistence_session_roundtrip_and_single_tab_reset() {
     assert_eq!(restored.active_index, 2);
     assert!(restored.tabs[0].pinned);
     assert_eq!(restored.tabs[0].url, "https://github.com/Tristar-1120/Rover");
+    assert_eq!(
+        restored.tabs[0].favicon,
+        "https://github.githubassets.com/favicons/favicon.svg"
+    );
     assert_eq!(restored.tabs[1].title, "The Rust Book");
+    assert_eq!(
+        restored.tabs[1].favicon,
+        "https://doc.rust-lang.org/favicon.ico"
+    );
     assert_eq!(restored.tabs[2].url, "https://github.com/rust-lang/rust");
     assert!(restored.groups.values().any(|g| g.name == "Rust Docs"));
     assert_eq!(restored.closed_stack.len(), 1);
@@ -245,6 +288,7 @@ fn test_tab_persistence_session_roundtrip_and_single_tab_reset() {
     assert_ne!(old_id.unwrap(), new_id);
     assert_eq!(single.tabs.len(), 1);
     assert_eq!(single.tabs[0].url, "rover:start");
+    assert_eq!(single.tabs[0].favicon, "/rover-icon.png");
     assert_eq!(single.closed_stack.len(), 1);
     assert_eq!(single.closed_stack[0].url, "https://example.org");
 }

@@ -16,8 +16,8 @@ use crate::omnibox::{
     suggest_for_search_bar, OmniboxSuggestion,
 };
 use crate::playground::{is_playground_address, render_playground_html};
-use crate::tabs::{load_session, save_session, TabStrip};
-use crate::tools::{extract_reader_article, render_reader_html};
+use crate::tabs::{default_favicon_for_url, load_session, save_session, TabStrip};
+use crate::tools::{extract_reader_article, render_reader_html, unique_download_path};
 use cef::args::Args;
 use cef::{self, Rect as CefRect, *};
 use parking_lot::Mutex;
@@ -29,7 +29,9 @@ use rover_ai::{
     context::{active_set, core_enabled, core_system, instruction_sets, save_sets, InstructionSet},
     localai::{parse_local_command, LocalCommand},
     pagejs,
-    providers::{chat_sync, preset_providers, Provider},
+    providers::{
+        chat_sync, fetch_models_sync, pick_model, preset_models_for, preset_providers, Provider,
+    },
     token_optimizer::SnapshotDiffer,
     usage::{Meter, UsageLog},
 };
@@ -42,9 +44,11 @@ use rover_net::{
     safebrowsing::SafeBrowsingGuard,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{
@@ -202,6 +206,211 @@ fn resolve_provider_key(store: &Store, p: &Provider) -> String {
     store.api_key(&p.id, &env_refs)
 }
 
+fn downloads_dir(store: &Store) -> PathBuf {
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let p = PathBuf::from(profile).join("Downloads");
+        if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
+            return p;
+        }
+    }
+    let fallback = store.root.join("Downloads");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0'..='\x1f' => '_',
+            _ => c,
+        })
+        .collect();
+    let trimmed = clean.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "download".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn host_of(raw_url: &str) -> String {
+    url::Url::parse(raw_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+fn load_persisted_model_cache(store: &Store) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    if let Some(obj) = store.get("model_cache").and_then(|v| v.as_object().cloned()) {
+        for (pid, val) in obj {
+            if let Some(arr) = val.as_array() {
+                let list: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                if !list.is_empty() {
+                    out.insert(pid, list);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn effective_model_for(
+    store: &Store,
+    model_cache: &HashMap<String, Vec<String>>,
+    p: &Provider,
+) -> String {
+    if let Some(ov) = store
+        .get("overrides")
+        .and_then(|o| o.get(&p.id).cloned())
+        .and_then(|o| {
+            o.get("model")
+                .and_then(|m| m.as_str())
+                .map(|s| s.trim().to_string())
+        })
+    {
+        if !ov.is_empty() {
+            return ov;
+        }
+    }
+    if let Some(cached) = model_cache.get(&p.id) {
+        if let Some(picked) = pick_model(cached, &p.model) {
+            return picked;
+        }
+    }
+    if let Some(first) = preset_models_for(&p.id).into_iter().next() {
+        return first;
+    }
+    p.model.clone()
+}
+
+fn models_for_provider(
+    provider_id: &str,
+    model_cache: &HashMap<String, Vec<String>>,
+    current_model: &str,
+) -> Vec<String> {
+    if provider_id == "local" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if !current_model.trim().is_empty() && seen.insert(current_model.to_string()) {
+        out.push(current_model.to_string());
+    }
+    if let Some(cached) = model_cache.get(provider_id) {
+        for m in cached {
+            if !m.trim().is_empty() && seen.insert(m.clone()) {
+                out.push(m.clone());
+            }
+        }
+    }
+    for m in preset_models_for(provider_id) {
+        if !m.trim().is_empty() && seen.insert(m.clone()) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+fn detect_icon_mime(url: &str, upstream_ct: Option<&str>, bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 4 {
+        if bytes[..4] == [0x00, 0x00, 0x01, 0x00] || bytes[..4] == [0x00, 0x00, 0x02, 0x00] {
+            return "image/x-icon";
+        }
+        if bytes[..4] == [0x89, b'P', b'N', b'G'] {
+            return "image/png";
+        }
+        if bytes.starts_with(b"GIF8") {
+            return "image/gif";
+        }
+        if bytes[..3] == [0xFF, 0xD8, 0xFF] {
+            return "image/jpeg";
+        }
+        if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            return "image/webp";
+        }
+    }
+    if let Ok(head) = std::str::from_utf8(&bytes[..bytes.len().min(256)]) {
+        let low = head.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+        if low.starts_with("<svg") || (low.starts_with("<?xml") && low.contains("<svg")) {
+            return "image/svg+xml";
+        }
+    }
+    if let Some(ct) = upstream_ct {
+        let low = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        match low.as_str() {
+            "image/x-icon" | "image/vnd.microsoft.icon" | "image/ico" => return "image/x-icon",
+            "image/png" => return "image/png",
+            "image/svg+xml" => return "image/svg+xml",
+            "image/webp" => return "image/webp",
+            "image/gif" => return "image/gif",
+            "image/jpeg" | "image/jpg" => return "image/jpeg",
+            _ => {}
+        }
+    }
+    let clean_path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if clean_path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if clean_path.ends_with(".png") {
+        "image/png"
+    } else if clean_path.ends_with(".webp") {
+        "image/webp"
+    } else if clean_path.ends_with(".gif") {
+        "image/gif"
+    } else if clean_path.ends_with(".jpg") || clean_path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else {
+        "image/x-icon"
+    }
+}
+
+fn fetch_favicon_bytes(raw_url: &str) -> Option<(String, Vec<u8>)> {
+    let parsed = url::Url::parse(raw_url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(4))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
+        .build();
+    let resp = agent
+        .get(parsed.as_str())
+        .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/x-icon,image/*,*/*;q=0.8")
+        .call()
+        .ok()?;
+    if resp.status() >= 400 {
+        return None;
+    }
+    let ct = resp.header("Content-Type").map(|s| s.to_string());
+    if let Some(ref c) = ct {
+        let low = c.to_ascii_lowercase();
+        if low.starts_with("text/html") || low.starts_with("application/json") {
+            return None;
+        }
+    }
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(256 * 1024)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() {
+        return None;
+    }
+    if let Ok(head) = std::str::from_utf8(&buf[..buf.len().min(128)]) {
+        let low = head.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+        if low.starts_with("<!doctype") || low.starts_with("<html") || low.starts_with("<head") {
+            return None;
+        }
+    }
+    let mime = detect_icon_mime(parsed.as_str(), ct.as_deref(), &buf);
+    Some((mime.to_string(), buf))
+}
+
 /// Must be called at the very start of `main()` on Windows so Chromium renderer,
 /// GPU, network, and utility helper subprocesses fork and exit cleanly.
 pub fn try_run_cef_subprocess() -> Option<i32> {
@@ -323,6 +532,18 @@ struct ChatMsg {
     kind: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct DownloadEntry {
+    id: u32,
+    filename: String,
+    url: String,
+    full_path: String,
+    received_bytes: i64,
+    total_bytes: i64,
+    percent: i32,
+    status: String,
+}
+
 enum RoverCmd {
     JsonCmd(Value),
     TabBrowserCreated {
@@ -331,6 +552,8 @@ enum RoverCmd {
     },
     ChromeBrowserCreated(Browser),
     PanelBrowserCreated(Browser),
+    DialogBrowserCreated(Browser),
+    DialogBrowserClosed,
     DevToolsCreated {
         tab_id: usize,
         browser: Browser,
@@ -342,6 +565,10 @@ enum RoverCmd {
     TabTitleChanged {
         tab_id: usize,
         title: String,
+    },
+    TabFaviconChanged {
+        tab_id: usize,
+        favicon: String,
     },
     TabLoadingChanged {
         tab_id: usize,
@@ -361,6 +588,19 @@ enum RoverCmd {
     TabHomeAction {
         action: String,
         index: Option<usize>,
+    },
+    DownloadStarted(DownloadEntry),
+    DownloadUpdated {
+        id: u32,
+        received_bytes: i64,
+        total_bytes: i64,
+        percent: i32,
+        full_path: String,
+        status: String,
+    },
+    ModelsFetched {
+        provider_id: String,
+        result: Result<Vec<String>, String>,
     },
     OmniRemoteReady {
         gen: u64,
@@ -429,11 +669,16 @@ struct BrowserState {
     tab_entries: HashMap<usize, TabBrowserEntry>,
     chrome_browser: Option<Browser>,
     panel_browser: Option<Browser>,
+    dialog_browser: Option<Browser>,
     dialog_hwnd: isize,
     panel_open: bool,
     find_open: bool,
     bookmarks_bar_visible: bool,
     reader_html_by_tab: HashMap<usize, String>,
+    downloads: Vec<DownloadEntry>,
+    cancel_downloads: HashSet<u32>,
+    model_cache: HashMap<String, Vec<String>>,
+    fetched_providers: HashSet<String>,
     messages: Vec<ChatMsg>,
     raw_log: String,
     ai_status: String,
@@ -506,6 +751,7 @@ struct RoverRuntime {
     queue: Mutex<VecDeque<RoverCmd>>,
     state: Mutex<BrowserState>,
     net: Mutex<NetFilterState>,
+    favicon_cache: Mutex<HashMap<String, Option<(String, Vec<u8>)>>>,
     next_cb_id: AtomicU64,
     next_task_id: AtomicU64,
     closing: AtomicBool,
@@ -566,10 +812,7 @@ impl RoverRuntime {
         let url = active_tab
             .map(|t| t.url.clone())
             .unwrap_or_else(|| "rover:start".into());
-        let host = url::Url::parse(&url)
-            .ok()
-            .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
-            .unwrap_or_default();
+        let host = host_of(&url);
         let blocked = if host.is_empty() {
             net.blocked_total
         } else {
@@ -582,10 +825,22 @@ impl RoverRuntime {
             .iter()
             .map(|t| {
                 let grp = t.group_id.as_deref().and_then(|gid| st.strip.groups.get(gid));
+                let tab_loading = st
+                    .tab_entries
+                    .get(&t.id)
+                    .map(|e| e.loading)
+                    .unwrap_or(false);
+                let fav = if t.favicon.is_empty() {
+                    default_favicon_for_url(&t.url)
+                } else {
+                    t.favicon.clone()
+                };
                 json!({
                     "id": t.id,
                     "title": t.title,
                     "url": t.url,
+                    "favicon": fav,
+                    "loading": tab_loading,
                     "pinned": t.pinned,
                     "sleeping": t.sleeping,
                     "group_name": grp.map(|g| g.name.clone()),
@@ -617,30 +872,31 @@ impl RoverRuntime {
             .store
             .get_str("selected")
             .unwrap_or_else(|| "gemini".to_string());
-        let overrides = st.store.get("overrides").unwrap_or_else(|| json!({}));
 
         let mut selected_model = String::new();
-        let providers_json: Vec<Value> = preset_providers()
+        let mut providers_json: Vec<Value> = preset_providers()
             .into_iter()
             .map(|p| {
                 let has_key = !p.needs_key || !resolve_provider_key(&st.store, &p).trim().is_empty();
-                let ov_model = overrides
-                    .get(&p.id)
-                    .and_then(|o| o.get("model"))
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| p.model.clone());
+                let eff_model = effective_model_for(&st.store, &st.model_cache, &p);
                 if p.id == selected_provider {
-                    selected_model = ov_model.clone();
+                    selected_model = eff_model.clone();
                 }
                 json!({
                     "id": p.id,
                     "name": p.name,
-                    "model": ov_model,
+                    "model": eff_model,
                     "configured": has_key,
                 })
             })
             .collect();
+        providers_json.push(json!({
+            "id": "local",
+            "name": "Rover Local (No AI · 0 tokens)",
+            "model": "",
+            "configured": true,
+        }));
+        let models_list = models_for_provider(&selected_provider, &st.model_cache, &selected_model);
 
         let sets = instruction_sets(&st.store);
         let active_core = active_set(&st.store).map(|s| s.name).unwrap_or_default();
@@ -655,6 +911,7 @@ impl RoverRuntime {
             st.session_meter.cost_summary()
         );
         let home_cfg = HomepageConfig::load(&st.store);
+        let dl_dir = downloads_dir(&st.store).display().to_string();
 
         json!({
             "tabs": tabs_json,
@@ -689,9 +946,12 @@ impl RoverRuntime {
             "home_tagline": home_cfg.tagline,
             "history": history,
             "reading_list": reading_list,
+            "downloads": st.downloads,
+            "downloads_dir": dl_dir,
             "providers": providers_json,
             "selected_provider": selected_provider,
             "selected_model": selected_model,
+            "models": models_list,
             "core_sets": core_sets_json,
             "core_active": active_core,
             "core_enabled": core_enabled(&st.store) && !sets.is_empty(),
@@ -719,7 +979,7 @@ impl RoverRuntime {
 
     fn push_ui_updates(&self) {
         let state_json = self.build_state_json().to_string();
-        let (chrome, panel, page_title, private) = {
+        let (chrome, panel, dialog, page_title, private) = {
             let st = self.state.lock();
             let title = st
                 .active_tab()
@@ -728,6 +988,7 @@ impl RoverRuntime {
             (
                 st.chrome_browser.clone(),
                 st.panel_browser.clone(),
+                st.dialog_browser.clone(),
                 title,
                 st.private,
             )
@@ -741,6 +1002,12 @@ impl RoverRuntime {
         if let Some(b) = panel {
             if let Some(f) = b.main_frame() {
                 let js = format!("window.roverUpdatePanel && window.roverUpdatePanel({state_json});");
+                f.execute_java_script(Some(&CefString::from(js.as_str())), None, 0);
+            }
+        }
+        if let Some(b) = dialog {
+            if let Some(f) = b.main_frame() {
+                let js = format!("window.roverUpdateDialog && window.roverUpdateDialog({state_json});");
                 f.execute_java_script(Some(&CefString::from(js.as_str())), None, 0);
             }
         }
@@ -1211,9 +1478,14 @@ impl RoverRuntime {
             let target = normalize_address(raw, &engine);
             let tid = match st.active_tab_mut() {
                 Some(t) => {
+                    let prev_host = host_of(&t.url);
+                    let next_host = host_of(&target);
                     t.url = target.clone();
                     if target == "rover:start" {
                         t.title = "New tab".into();
+                        t.favicon = "/rover-icon.png".into();
+                    } else if next_host != prev_host || t.favicon.is_empty() || t.favicon == "/rover-icon.png" {
+                        t.favicon = default_favicon_for_url(&target);
                     }
                     t.id
                 }
@@ -2108,6 +2380,50 @@ impl RoverRuntime {
         }
     }
 
+    fn trigger_refresh_models(&self, provider_id: &str) {
+        if provider_id == "local" {
+            self.state.lock().ai_status =
+                "Rover Local uses built-in zero-token commands (no remote models).".into();
+            self.push_ui_updates();
+            return;
+        }
+        let (prov_opt, api_key) = {
+            let mut st = self.state.lock();
+            let prov = preset_providers().into_iter().find(|p| p.id == provider_id);
+            let key = prov
+                .as_ref()
+                .map(|p| resolve_provider_key(&st.store, p))
+                .unwrap_or_default();
+            if let Some(ref p) = prov {
+                if p.needs_key && key.trim().is_empty() {
+                    st.ai_status = format!(
+                        "Add an API key for {} first (click ⚙) to fetch live models.",
+                        p.name
+                    );
+                    drop(st);
+                    self.push_ui_updates();
+                    return;
+                }
+                st.fetched_providers.insert(p.id.clone());
+                st.ai_status = format!("Fetching models from {}…", p.name);
+            }
+            (prov, key)
+        };
+        let Some(prov) = prov_opt else { return };
+        self.push_ui_updates();
+
+        let pid = prov.id.clone();
+        std::thread::spawn(move || {
+            let result = fetch_models_sync(&prov, &api_key);
+            if let Some(rt) = GLOBAL_APP.get() {
+                rt.post(RoverCmd::ModelsFetched {
+                    provider_id: pid,
+                    result,
+                });
+            }
+        });
+    }
+
     fn handle_ai_prompt(&self, text: String, bypass_pwguard: bool) {
         if !bypass_pwguard {
             if let Some(reason) = pwguard::check(&text) {
@@ -2122,7 +2438,7 @@ impl RoverRuntime {
             }
         }
 
-        let current_url = {
+        let (selected_pid, current_url) = {
             let mut st = self.state.lock();
             st.pw_warning.clear();
             st.held_prompt.clear();
@@ -2132,89 +2448,108 @@ impl RoverRuntime {
                 text: text.clone(),
                 kind: "user".into(),
             });
-            st.active_tab()
-                .map(|t| t.url.clone())
-                .unwrap_or_else(|| "rover:start".into())
-        };
-        self.push_ui_updates();
-
-        // 1. Check zero-token Rover Local commands first ($0.00, instant!)
-        match parse_local_command(&text, &current_url) {
-            LocalCommand::Help { text: help_txt } => {
-                self.append_ai_msg("Rover Local", "0 tokens", &help_txt, "ai");
-                return;
-            }
-            LocalCommand::Steps { steps } if !steps.is_empty() => {
-                let mut summary = Vec::new();
-                for s in steps {
-                    match s.action.as_str() {
-                        "navigate" => {
-                            if let Some(u) = s.args.get("url").and_then(|v| v.as_str()) {
-                                self.navigate_active(u);
-                                summary.push(format!("Opened `{u}`."));
-                            }
-                        }
-                        "search" => {
-                            if let Some(q) = s.args.get("query").and_then(|v| v.as_str()) {
-                                self.navigate_active(q);
-                                summary.push(format!("Searching for **{q}**."));
-                            }
-                        }
-                        "new_tab" => {
-                            self.open_new_tab(s.args.get("url").and_then(|v| v.as_str()));
-                            summary.push("Opened a new tab.".into());
-                        }
-                        "back" => {
-                            if let Some(b) = self.active_browser() {
-                                b.go_back();
-                            }
-                            summary.push("Went back.".into());
-                        }
-                        "forward" => {
-                            if let Some(b) = self.active_browser() {
-                                b.go_forward();
-                            }
-                            summary.push("Went forward.".into());
-                        }
-                        "reload" => {
-                            if let Some(b) = self.active_browser() {
-                                b.reload();
-                            }
-                            summary.push("Reloaded the page.".into());
-                        }
-                        "group_by_site" => {
-                            self.state.lock().strip.group_by_site();
-                            self.push_ui_updates();
-                            summary.push("Grouped tabs by site.".into());
-                        }
-                        _ => {}
-                    }
-                }
-                if !summary.is_empty() {
-                    self.append_ai_msg("Rover Local", "0 tokens", &summary.join(" "), "ai");
-                    return;
-                }
-            }
-            _ => {}
-        }
-
-        // 2. Live Autonomous Rover Agent in Pure Chromium
-        let (provider_opt, api_key, tab_id, cfg, core_instr, mem_text) = {
-            let st = self.state.lock();
             let pid = st
                 .store
                 .get_str("selected")
                 .unwrap_or_else(|| "gemini".into());
-            let mut prov = preset_providers().into_iter().find(|p| p.id == pid);
-            if let Some(ref mut p) = prov {
-                if let Some(ov_m) = st
-                    .store
-                    .get("overrides")
-                    .and_then(|o| o.get(&p.id).cloned())
-                    .and_then(|o| o.get("model").and_then(|m| m.as_str().map(|s| s.to_string())))
-                {
-                    p.model = ov_m;
+            let cur = st
+                .active_tab()
+                .map(|t| t.url.clone())
+                .unwrap_or_else(|| "rover:start".into());
+            (pid, cur)
+        };
+        self.push_ui_updates();
+
+        // 1. Only use Rover Local when the user explicitly selected the "local" provider!
+        if selected_pid == "local" {
+            match parse_local_command(&text, &current_url) {
+                LocalCommand::Help { text: help_txt } => {
+                    self.append_ai_msg("Rover Local", "0 tokens", &help_txt, "ai");
                 }
+                LocalCommand::Steps { steps } if !steps.is_empty() => {
+                    let mut summary = Vec::new();
+                    for s in steps {
+                        match s.action.as_str() {
+                            "navigate" => {
+                                if let Some(u) = s.args.get("url").and_then(|v| v.as_str()) {
+                                    self.navigate_active(u);
+                                    summary.push(format!("Opened `{u}`."));
+                                }
+                            }
+                            "search" => {
+                                if let Some(q) = s.args.get("query").and_then(|v| v.as_str()) {
+                                    self.navigate_active(q);
+                                    summary.push(format!("Searching for **{q}**."));
+                                }
+                            }
+                            "new_tab" => {
+                                self.open_new_tab(s.args.get("url").and_then(|v| v.as_str()));
+                                summary.push("Opened a new tab.".into());
+                            }
+                            "back" => {
+                                if let Some(b) = self.active_browser() {
+                                    b.go_back();
+                                }
+                                summary.push("Went back.".into());
+                            }
+                            "forward" => {
+                                if let Some(b) = self.active_browser() {
+                                    b.go_forward();
+                                }
+                                summary.push("Went forward.".into());
+                            }
+                            "reload" => {
+                                if let Some(b) = self.active_browser() {
+                                    b.reload();
+                                }
+                                summary.push("Reloaded the page.".into());
+                            }
+                            "group_by_site" => {
+                                self.state.lock().strip.group_by_site();
+                                self.push_ui_updates();
+                                summary.push("Grouped tabs by site.".into());
+                            }
+                            other => {
+                                summary.push(format!("Queued `{other}`."));
+                            }
+                        }
+                    }
+                    let msg = if summary.is_empty() {
+                        "Done.".to_string()
+                    } else {
+                        summary.join(" ")
+                    };
+                    self.append_ai_msg("Rover Local", "0 tokens", &msg, "ai");
+                }
+                LocalCommand::Watch { spec } => {
+                    self.append_ai_msg(
+                        "Rover Local",
+                        "0 tokens",
+                        &format!("Watcher spec parsed: `{spec}`."),
+                        "ai",
+                    );
+                }
+                LocalCommand::Unknown { msg } => {
+                    self.append_ai_msg("Rover Local", "0 tokens", &msg, "ai");
+                }
+                _ => {
+                    self.append_ai_msg(
+                        "Rover Local",
+                        "0 tokens",
+                        "Type `help` for built-in zero-token commands, or choose an AI provider above to chat with an LLM.",
+                        "ai",
+                    );
+                }
+            }
+            return;
+        }
+
+        // 2. Live Autonomous Rover Agent using the user's selected provider & model
+        let (provider_opt, api_key, tab_id, cfg, core_instr, mem_text) = {
+            let st = self.state.lock();
+            let mut prov = preset_providers().into_iter().find(|p| p.id == selected_pid);
+            if let Some(ref mut p) = prov {
+                p.model = effective_model_for(&st.store, &st.model_cache, p);
                 p.token_saver = st.store.get_bool("token_saver", true);
             }
             let key = prov
@@ -2268,7 +2603,7 @@ impl RoverRuntime {
         {
             let mut st = self.state.lock();
             st.ai_busy = true;
-            st.ai_status = format!("Reading page for {}…", provider.name);
+            st.ai_status = format!("Reading page for {} ({})…", provider.name, provider.model);
             st.active_agent = Some(ActiveAgentRun {
                 task_id,
                 state: agent_state,
@@ -2661,6 +2996,14 @@ impl RoverRuntime {
                 self.layout_windows();
                 self.push_ui_updates();
             }
+            RoverCmd::DialogBrowserCreated(b) => {
+                self.state.lock().dialog_browser = Some(b);
+            }
+            RoverCmd::DialogBrowserClosed => {
+                let mut st = self.state.lock();
+                st.dialog_browser = None;
+                st.dialog_hwnd = 0;
+            }
             RoverCmd::TabBrowserCreated { tab_id, browser } => {
                 self.state
                     .lock()
@@ -2685,9 +3028,17 @@ impl RoverRuntime {
                 {
                     let mut st = self.state.lock();
                     if let Some(t) = st.strip.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        let prev_host = host_of(&t.url);
+                        let next_host = host_of(&logical);
                         t.url = logical.clone();
                         if logical == "rover:start" {
                             t.title = "New tab".into();
+                            t.favicon = "/rover-icon.png".into();
+                        } else if next_host != prev_host
+                            || t.favicon.is_empty()
+                            || t.favicon == "/rover-icon.png"
+                        {
+                            t.favicon = default_favicon_for_url(&logical);
                         }
                     }
                 }
@@ -2707,6 +3058,110 @@ impl RoverRuntime {
                 }
                 self.push_ui_updates();
                 self.save_session_now();
+            }
+            RoverCmd::TabFaviconChanged { tab_id, favicon } => {
+                let mut changed = false;
+                {
+                    let mut st = self.state.lock();
+                    if let Some(t) = st.strip.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if t.url != "rover:start" && !favicon.is_empty() && t.favicon != favicon {
+                            t.favicon = favicon;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    self.push_ui_updates();
+                    self.save_session_now();
+                }
+            }
+            RoverCmd::DownloadStarted(entry) => {
+                {
+                    let mut st = self.state.lock();
+                    if let Some(existing) = st.downloads.iter_mut().find(|d| d.id == entry.id) {
+                        *existing = entry;
+                    } else {
+                        st.downloads.insert(0, entry);
+                        if st.downloads.len() > 200 {
+                            st.downloads.truncate(200);
+                        }
+                    }
+                }
+                self.push_ui_updates();
+            }
+            RoverCmd::DownloadUpdated {
+                id,
+                received_bytes,
+                total_bytes,
+                percent,
+                full_path,
+                status,
+            } => {
+                {
+                    let mut st = self.state.lock();
+                    if let Some(existing) = st.downloads.iter_mut().find(|d| d.id == id) {
+                        existing.received_bytes = received_bytes;
+                        existing.total_bytes = total_bytes;
+                        existing.percent = percent;
+                        if !full_path.is_empty() {
+                            existing.full_path = full_path.clone();
+                            if let Some(name) = std::path::Path::new(&full_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                            {
+                                if !name.is_empty() {
+                                    existing.filename = name.to_string();
+                                }
+                            }
+                        }
+                        existing.status = status;
+                    }
+                }
+                self.push_ui_updates();
+            }
+            RoverCmd::ModelsFetched {
+                provider_id,
+                result,
+            } => {
+                {
+                    let mut st = self.state.lock();
+                    let prov_opt = preset_providers().into_iter().find(|p| p.id == provider_id);
+                    let prov_name = prov_opt
+                        .as_ref()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| provider_id.clone());
+                    match result {
+                        Ok(models) if !models.is_empty() => {
+                            let count = models.len();
+                            st.model_cache.insert(provider_id.clone(), models.clone());
+                            st.store.set("model_cache", json!(st.model_cache));
+                            if let Some(ref p) = prov_opt {
+                                let cur = effective_model_for(&st.store, &st.model_cache, p);
+                                if !models.iter().any(|m| m == &cur) {
+                                    if let Some(best) = pick_model(&models, &cur) {
+                                        let mut ov =
+                                            st.store.get("overrides").unwrap_or_else(|| json!({}));
+                                        if let Some(obj) = ov.as_object_mut() {
+                                            obj.insert(
+                                                provider_id.clone(),
+                                                json!({ "model": best }),
+                                            );
+                                        }
+                                        st.store.set("overrides", ov);
+                                    }
+                                }
+                            }
+                            st.ai_status = format!("Loaded {count} models for {prov_name}.");
+                        }
+                        Ok(_) => {
+                            st.ai_status = format!("{prov_name} returned no chat models.");
+                        }
+                        Err(e) => {
+                            st.ai_status = e;
+                        }
+                    }
+                }
+                self.push_ui_updates();
             }
             RoverCmd::TabLoadingChanged {
                 tab_id,
@@ -2988,6 +3443,7 @@ impl RoverRuntime {
                 "panel" => self.dispatch_menu_id(140),
                 "settings" => self.dispatch_menu_id(143),
                 "history" => self.dispatch_menu_id(111),
+                "downloads" => self.dispatch_menu_id(114),
                 "bookmarks_mgr" => self.dispatch_menu_id(110),
                 "bookmarks_bar" => self.dispatch_menu_id(127),
                 "split" => self.toggle_split_view(),
@@ -3152,24 +3608,54 @@ impl RoverRuntime {
             "close_find" => self.toggle_find(false),
             "set_provider" => {
                 if let Some(pid) = v.get("id").and_then(|s| s.as_str()) {
-                    self.state.lock().store.set("selected", json!(pid));
+                    let should_fetch = {
+                        let mut st = self.state.lock();
+                        st.store.set("selected", json!(pid));
+                        st.ai_status.clear();
+                        if pid == "local" || st.fetched_providers.contains(pid) {
+                            false
+                        } else {
+                            preset_providers()
+                                .into_iter()
+                                .find(|p| p.id == pid)
+                                .map(|p| {
+                                    !p.needs_key
+                                        || !resolve_provider_key(&st.store, &p).trim().is_empty()
+                                })
+                                .unwrap_or(false)
+                        }
+                    };
                     self.push_ui_updates();
+                    if should_fetch {
+                        self.trigger_refresh_models(pid);
+                    }
                 }
             }
             "set_model" => {
                 if let Some(model) = v.get("model").and_then(|s| s.as_str()) {
-                    let st = self.state.lock();
-                    let pid = st
-                        .store
-                        .get_str("selected")
-                        .unwrap_or_else(|| "gemini".into());
-                    let mut ov = st.store.get("overrides").unwrap_or_else(|| json!({}));
-                    if let Some(obj) = ov.as_object_mut() {
-                        obj.insert(pid, json!({"model": model.trim()}));
+                    let trimmed = model.trim();
+                    if !trimmed.is_empty() {
+                        let mut st = self.state.lock();
+                        let pid = v
+                            .get("provider")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                st.store
+                                    .get_str("selected")
+                                    .unwrap_or_else(|| "gemini".into())
+                            });
+                        if pid != "local" {
+                            let mut ov = st.store.get("overrides").unwrap_or_else(|| json!({}));
+                            if let Some(obj) = ov.as_object_mut() {
+                                obj.insert(pid, json!({"model": trimmed}));
+                            }
+                            st.store.set("overrides", ov);
+                            st.ai_status = format!("Model set to {trimmed}.");
+                        }
+                        drop(st);
+                        self.push_ui_updates();
                     }
-                    st.store.set("overrides", ov);
-                    drop(st);
-                    self.push_ui_updates();
                 }
             }
             "set_api_key" => {
@@ -3177,8 +3663,19 @@ impl RoverRuntime {
                     v.get("id").and_then(|s| s.as_str()),
                     v.get("key").and_then(|s| s.as_str()),
                 ) {
-                    let _ = self.state.lock().store.set_api_key(pid, key);
+                    let activate = v.get("activate").and_then(|b| b.as_bool()).unwrap_or(false);
+                    {
+                        let mut st = self.state.lock();
+                        let _ = st.store.set_api_key(pid, key);
+                        st.fetched_providers.remove(pid);
+                        if activate {
+                            st.store.set("selected", json!(pid));
+                        }
+                    }
                     self.push_ui_updates();
+                    if !key.trim().is_empty() {
+                        self.trigger_refresh_models(pid);
+                    }
                 }
             }
             "set_setting" => {
@@ -3265,6 +3762,53 @@ impl RoverRuntime {
                 }
                 self.push_ui_updates();
             }
+            "open_download" => {
+                if let Some(path) = v.get("path").and_then(|s| s.as_str()) {
+                    if !path.is_empty() && std::path::Path::new(path).exists() {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/C", "start", "", path])
+                            .creation_flags(0x0800_0000)
+                            .spawn();
+                    }
+                }
+            }
+            "show_download_folder" => {
+                if let Some(path) = v.get("path").and_then(|s| s.as_str()) {
+                    if !path.is_empty() {
+                        let _ = std::process::Command::new("explorer.exe")
+                            .arg(format!("/select,{path}"))
+                            .spawn();
+                    }
+                }
+            }
+            "open_downloads_folder" => {
+                let dir = {
+                    let st = self.state.lock();
+                    downloads_dir(&st.store)
+                };
+                let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+            }
+            "cancel_download" => {
+                if let Some(id) = v.get("id").and_then(|n| n.as_u64()) {
+                    let id32 = id as u32;
+                    let mut st = self.state.lock();
+                    st.cancel_downloads.insert(id32);
+                    if let Some(d) = st.downloads.iter_mut().find(|d| d.id == id32) {
+                        if d.status == "in_progress" {
+                            d.status = "canceled".into();
+                        }
+                    }
+                    drop(st);
+                    self.push_ui_updates();
+                }
+            }
+            "clear_downloads" => {
+                self.state
+                    .lock()
+                    .downloads
+                    .retain(|d| d.status == "in_progress");
+                self.push_ui_updates();
+            }
             "toggle_adblock" => self.dispatch_menu_id(201),
             "toggle_domain_block" => self.dispatch_menu_id(202),
             "toggle_darkmode" => self.dispatch_menu_id(203),
@@ -3308,8 +3852,13 @@ impl RoverRuntime {
                 self.push_ui_updates();
             }
             "refresh_models" => {
-                self.state.lock().ai_status = "Models list is ready.".into();
-                self.push_ui_updates();
+                let pid = self
+                    .state
+                    .lock()
+                    .store
+                    .get_str("selected")
+                    .unwrap_or_else(|| "gemini".into());
+                self.trigger_refresh_models(&pid);
             }
             _ => {}
         }
@@ -3426,6 +3975,7 @@ wrap_keyboard_handler! {
                 (true, true, false, 0x41) => Some("panel"),
                 (true, false, false, 0xBC) => Some("settings"),
                 (true, false, false, 0x48) => Some("history"),
+                (true, false, false, 0x4A) => Some("downloads"),
                 (true, true, false, 0x4F) => Some("bookmarks_mgr"),
                 (true, true, false, 0x42) => Some("bookmarks_bar"),
                 (true, true, false, 0x45) => Some("split"),
@@ -3497,7 +4047,7 @@ wrap_life_span_handler! {
                 match self.role {
                     UiRole::Chrome => rt.post(RoverCmd::ChromeBrowserCreated(b.clone())),
                     UiRole::Panel => rt.post(RoverCmd::PanelBrowserCreated(b.clone())),
-                    UiRole::Dialog(_) => {}
+                    UiRole::Dialog(_) => rt.post(RoverCmd::DialogBrowserCreated(b.clone())),
                 }
             }
         }
@@ -3512,6 +4062,9 @@ wrap_life_span_handler! {
         }
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
             if let UiRole::Dialog(dlg_hwnd) = self.role {
+                if let Some(rt) = GLOBAL_APP.get() {
+                    rt.post(RoverCmd::DialogBrowserClosed);
+                }
                 if dlg_hwnd != 0 {
                     unsafe {
                         PostMessageW(dlg_hwnd as HWND, WM_CLOSE, 0, 0);
@@ -3657,6 +4210,44 @@ wrap_display_handler! {
             }
         }
 
+        fn on_favicon_urlchange(
+            &self,
+            _browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            if let (Some(rt), Some(list)) = (GLOBAL_APP.get(), icon_urls) {
+                let raw: *mut cef::sys::_cef_string_list_t = list.into();
+                if raw.is_null() {
+                    return;
+                }
+                let count = unsafe { cef::sys::cef_string_list_size(raw) };
+                let mut urls = Vec::new();
+                for i in 0..count {
+                    let mut val: cef::sys::cef_string_t = unsafe { std::mem::zeroed() };
+                    if unsafe { cef::sys::cef_string_list_value(raw, i, &mut val) } != 0 {
+                        let s = CefString::from(ptr::from_ref(&val)).to_string();
+                        if !s.trim().is_empty() {
+                            urls.push(s);
+                        }
+                    }
+                }
+                let chosen = urls
+                    .iter()
+                    .find(|u| {
+                        let low = u.split('?').next().unwrap_or(u).to_ascii_lowercase();
+                        low.ends_with(".ico") || low.ends_with(".png") || low.ends_with(".svg")
+                    })
+                    .or_else(|| urls.first())
+                    .cloned();
+                if let Some(fav) = chosen {
+                    rt.post(RoverCmd::TabFaviconChanged {
+                        tab_id: self.tab_id,
+                        favicon: fav,
+                    });
+                }
+            }
+        }
+
         fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
             if let Some(rt) = GLOBAL_APP.get() {
                 rt.post(RoverCmd::TabProgressChanged {
@@ -3747,6 +4338,128 @@ wrap_load_handler! {
     }
 }
 
+wrap_download_handler! {
+    struct TabDownloadHandler;
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            if let (Some(rt), Some(item), Some(cb)) = (GLOBAL_APP.get(), download_item, callback) {
+                let id = item.id();
+                let u_uf = item.url();
+                let mut url = CefString::from(&u_uf).to_string();
+                if url.is_empty() {
+                    let ou_uf = item.original_url();
+                    url = CefString::from(&ou_uf).to_string();
+                }
+                let raw_name = suggested_name
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        let sn_uf = item.suggested_file_name();
+                        let sn = CefString::from(&sn_uf).to_string();
+                        if !sn.trim().is_empty() {
+                            sn
+                        } else {
+                            url::Url::parse(&url)
+                                .ok()
+                                .and_then(|u| {
+                                    u.path_segments()
+                                        .and_then(|segs| segs.last().map(|s| s.to_string()))
+                                })
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| "download".to_string())
+                        }
+                    });
+                let safe_name = sanitize_filename(&raw_name);
+                let dl_dir = {
+                    let st = rt.state.lock();
+                    downloads_dir(&st.store)
+                };
+                let dest = unique_download_path(&dl_dir, &safe_name);
+                let dest_str = dest.to_string_lossy().to_string();
+                let final_name = dest
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&safe_name)
+                    .to_string();
+                let total = item.total_bytes();
+                let received = item.received_bytes();
+                let pct = item.percent_complete().max(0);
+                rt.post(RoverCmd::DownloadStarted(DownloadEntry {
+                    id,
+                    filename: final_name,
+                    url,
+                    full_path: dest_str.clone(),
+                    received_bytes: received,
+                    total_bytes: total,
+                    percent: pct,
+                    status: "in_progress".into(),
+                }));
+                cb.cont(Some(&CefString::from(dest_str.as_str())), 0);
+                return 1;
+            }
+            0
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            callback: Option<&mut DownloadItemCallback>,
+        ) {
+            if let (Some(rt), Some(item)) = (GLOBAL_APP.get(), download_item) {
+                let id = item.id();
+                let should_cancel = rt.state.lock().cancel_downloads.remove(&id);
+                if should_cancel {
+                    if let Some(cb) = callback {
+                        cb.cancel();
+                    }
+                }
+                let received = item.received_bytes();
+                let total = item.total_bytes();
+                let mut pct = item.percent_complete();
+                if pct < 0 && total > 0 {
+                    pct = (received.saturating_mul(100) / total).clamp(0, 100) as i32;
+                }
+                let fp_uf = item.full_path();
+                let full_path = CefString::from(&fp_uf).to_string();
+                let status = if item.is_complete() != 0 {
+                    "complete"
+                } else if item.is_canceled() != 0 || should_cancel {
+                    "canceled"
+                } else if item.is_interrupted() != 0 {
+                    "interrupted"
+                } else {
+                    "in_progress"
+                };
+                rt.post(RoverCmd::DownloadUpdated {
+                    id,
+                    received_bytes: received,
+                    total_bytes: total,
+                    percent: if status == "complete" { 100 } else { pct.max(0) },
+                    full_path,
+                    status: status.to_string(),
+                });
+            }
+        }
+    }
+}
+
 wrap_resource_request_handler! {
     struct TabResourceRequestHandler;
 
@@ -3828,6 +4541,9 @@ wrap_client! {
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(TabLoadHandler::new(self.tab_id))
         }
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(TabDownloadHandler::new())
+        }
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(TabRequestHandler::new())
         }
@@ -3890,8 +4606,14 @@ fn spawn_control_server(rt: Arc<RoverRuntime>, server: Server) {
 
             if path == "/rover-icon.png" || path == "/favicon.ico" {
                 let h = Header::from_bytes(&b"Content-Type"[..], &b"image/png"[..]).unwrap();
-                let _ = req
-                    .respond(Response::from_data(ROVER_ICON_PNG_BYTES.to_vec()).with_header(h));
+                let h_cc =
+                    Header::from_bytes(&b"Cache-Control"[..], &b"public, max-age=86400"[..])
+                        .unwrap();
+                let _ = req.respond(
+                    Response::from_data(ROVER_ICON_PNG_BYTES.to_vec())
+                        .with_header(h)
+                        .with_header(h_cc),
+                );
                 continue;
             }
 
@@ -3905,6 +4627,98 @@ fn spawn_control_server(rt: Arc<RoverRuntime>, server: Server) {
                 let body = rt.build_state_json().to_string();
                 let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
                 let _ = req.respond(Response::from_string(body).with_header(h));
+                continue;
+            }
+
+            if path == "/api/favicon" {
+                let mut target_u = String::new();
+                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                    if k.as_ref() == "u" {
+                        target_u = v.into_owned();
+                    }
+                }
+                let is_self = url::Url::parse(&target_u)
+                    .ok()
+                    .map(|u| {
+                        matches!(u.host_str(), Some("127.0.0.1" | "localhost"))
+                            && u.port() == Some(rt.port)
+                    })
+                    .unwrap_or(false);
+                if target_u.is_empty() || is_self {
+                    let _ = req.respond(Response::from_string("").with_status_code(404));
+                    continue;
+                }
+                let cached = rt.favicon_cache.lock().get(&target_u).cloned();
+                if let Some(entry) = cached {
+                    match entry {
+                        Some((mime, bytes)) => {
+                            let h_ct =
+                                Header::from_bytes(&b"Content-Type"[..], mime.as_bytes()).unwrap();
+                            let h_cc = Header::from_bytes(
+                                &b"Cache-Control"[..],
+                                &b"public, max-age=86400"[..],
+                            )
+                            .unwrap();
+                            let _ = req.respond(
+                                Response::from_data(bytes)
+                                    .with_header(h_ct)
+                                    .with_header(h_cc),
+                            );
+                        }
+                        None => {
+                            let h_cc = Header::from_bytes(
+                                &b"Cache-Control"[..],
+                                &b"public, max-age=300"[..],
+                            )
+                            .unwrap();
+                            let _ = req.respond(
+                                Response::from_string("")
+                                    .with_status_code(404)
+                                    .with_header(h_cc),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let rt_bg = rt.clone();
+                std::thread::spawn(move || {
+                    let fetched = fetch_favicon_bytes(&target_u);
+                    {
+                        let mut cache = rt_bg.favicon_cache.lock();
+                        if cache.len() >= 512 {
+                            cache.clear();
+                        }
+                        cache.insert(target_u, fetched.clone());
+                    }
+                    match fetched {
+                        Some((mime, bytes)) => {
+                            let h_ct =
+                                Header::from_bytes(&b"Content-Type"[..], mime.as_bytes()).unwrap();
+                            let h_cc = Header::from_bytes(
+                                &b"Cache-Control"[..],
+                                &b"public, max-age=86400"[..],
+                            )
+                            .unwrap();
+                            let _ = req.respond(
+                                Response::from_data(bytes)
+                                    .with_header(h_ct)
+                                    .with_header(h_cc),
+                            );
+                        }
+                        None => {
+                            let h_cc = Header::from_bytes(
+                                &b"Cache-Control"[..],
+                                &b"public, max-age=300"[..],
+                            )
+                            .unwrap();
+                            let _ = req.respond(
+                                Response::from_string("")
+                                    .with_status_code(404)
+                                    .with_header(h_cc),
+                            );
+                        }
+                    }
+                });
                 continue;
             }
 
@@ -4300,7 +5114,44 @@ unsafe extern "system" fn dialog_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_SIZE => {
+            if let Some(rt) = GLOBAL_APP.get() {
+                let b_opt = {
+                    let st = rt.state.lock();
+                    if st.dialog_hwnd == hwnd as isize {
+                        st.dialog_browser.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(b) = b_opt {
+                    if let Some(host) = b.host() {
+                        let ch = cef_to_win_hwnd(host.window_handle());
+                        if !ch.is_null() {
+                            let mut rc: RECT = std::mem::zeroed();
+                            GetClientRect(hwnd, &mut rc);
+                            MoveWindow(
+                                ch,
+                                0,
+                                0,
+                                (rc.right - rc.left).max(1),
+                                (rc.bottom - rc.top).max(1),
+                                1,
+                            );
+                        }
+                    }
+                }
+            }
+            0
+        }
         WM_CLOSE => {
+            if let Some(rt) = GLOBAL_APP.get() {
+                let mut st = rt.state.lock();
+                if st.dialog_hwnd == hwnd as isize {
+                    st.dialog_browser = None;
+                    st.dialog_hwnd = 0;
+                }
+            }
             DestroyWindow(hwnd);
             0
         }
@@ -4397,6 +5248,7 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
             target.clone()
         };
         if strip.tabs.len() == 1 && strip.tabs[0].url == "rover:start" {
+            strip.tabs[0].favicon = default_favicon_for_url(&target);
             strip.tabs[0].url = target;
             strip.tabs[0].title = title;
         } else {
@@ -4425,6 +5277,7 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
     let bm_bar_vis = store.get_bool("bookmarks_bar", true);
     let usage_log = UsageLog::new(store.root.join("usage.log"));
     let memory = MemoryFile::new(store.root.join("Rover Memory.md"));
+    let model_cache = load_persisted_model_cache(&store);
     let greeting = initial_greeting(&store);
 
     let runtime = Arc::new(RoverRuntime {
@@ -4442,11 +5295,16 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
             tab_entries,
             chrome_browser: None,
             panel_browser: None,
+            dialog_browser: None,
             dialog_hwnd: 0,
             panel_open,
             find_open: false,
             bookmarks_bar_visible: bm_bar_vis,
             reader_html_by_tab: HashMap::new(),
+            downloads: Vec::new(),
+            cancel_downloads: HashSet::new(),
+            model_cache,
+            fetched_providers: HashSet::new(),
             messages: vec![greeting],
             raw_log: String::new(),
             ai_status: String::new(),
@@ -4463,6 +5321,7 @@ pub fn run_chromium_browser(initial_url: Option<String>, private: bool) {
             pending_js: HashMap::new(),
         }),
         net: Mutex::new(net_filter),
+        favicon_cache: Mutex::new(HashMap::new()),
         next_cb_id: AtomicU64::new(1),
         next_task_id: AtomicU64::new(1),
         closing: AtomicBool::new(false),
