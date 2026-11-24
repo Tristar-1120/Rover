@@ -1,0 +1,141 @@
+name: Build & Publish Windows Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach installer to (e.g. v2.0.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag and version
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          $ver = $tag -replace '^v', ''
+          echo "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Ensure Ninja and NSIS are available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            $nsisPath = "C:\Program Files (x86)\NSIS"
+            if (Test-Path "$nsisPath\makensis.exe") {
+              echo $nsisPath | Out-File -FilePath $env:GITHUB_PATH -Append
+            } else {
+              choco install nsis -y --no-progress
+            }
+          }
+
+      - name: Build rover.exe (Pure Chromium 156 CEF, static CRT)
+        shell: pwsh
+        env:
+          CEF_PATH: C:\cef_cache
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CEF_PATH | Out-Null
+          cargo build --release --target x86_64-pc-windows-msvc --bin rover
+
+      - name: Run Rust workspace tests
+        shell: pwsh
+        env:
+          CEF_PATH: C:\cef_cache
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $cefRuntime = Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 2 -Filter "cef_windows_x86_64" | Select-Object -First 1 -ExpandProperty FullName
+          if ($cefRuntime) { $env:PATH = "$cefRuntime;$env:PATH" }
+          cargo test --workspace --target x86_64-pc-windows-msvc
+
+      - name: Stage Pure Chromium 156 runtime and build NSIS installer
+        shell: pwsh
+        env:
+          CEF_PATH: C:\cef_cache
+        run: |
+          $stageDir = "dist\stage"
+          if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
+          New-Item -ItemType Directory -Force -Path "$stageDir\locales" | Out-Null
+
+          $cefRuntime = Get-ChildItem -Path $env:CEF_PATH -Directory -Recurse -Depth 2 -Filter "cef_windows_x86_64" | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cefRuntime) {
+            throw "Could not find cef_windows_x86_64 under $env:CEF_PATH"
+          }
+          Write-Host "Staging CEF 156 runtime from $cefRuntime"
+
+          Copy-Item -Force "target\x86_64-pc-windows-msvc\release\rover.exe" "$stageDir\"
+          foreach ($ext in @("dll", "pak", "dat", "bin")) {
+            Get-ChildItem -Path $cefRuntime -Filter "*.$ext" -File | Copy-Item -Destination $stageDir -Force
+          }
+          if (Test-Path "$cefRuntime\vk_swiftshader_icd.json") {
+            Copy-Item -Force "$cefRuntime\vk_swiftshader_icd.json" "$stageDir\"
+          }
+          if (Test-Path "$cefRuntime\locales") {
+            Get-ChildItem -Path "$cefRuntime\locales" -Filter "*.pak" -File | Copy-Item -Destination "$stageDir\locales" -Force
+          }
+
+          if (Test-Path "$stageDir\WebView2Loader.dll") {
+            throw "WebView2Loader.dll must not be staged!"
+          }
+          if (-not (Test-Path "$stageDir\libcef.dll")) {
+            throw "libcef.dll missing from staging directory!"
+          }
+
+          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) { $makensis = "C:\Program Files (x86)\NSIS\makensis.exe" }
+          & $makensis -V2 packaging\windows\rover.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $installer = "dist\RoverSetup-${{ steps.meta.outputs.version }}.exe"
+          if (-not (Test-Path $installer)) {
+            $fallback = Get-ChildItem -Path "dist" -Filter "RoverSetup-*.exe" | Select-Object -First 1
+            if (-not $fallback) { throw "Installer not found in dist/" }
+            $installer = $fallback.FullName
+          }
+          Get-Item $installer | Format-List Name, Length
+
+      - name: Upload Windows Installer directly to GitHub Release Assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $ver = "${{ steps.meta.outputs.version }}"
+          $installer = (Get-ChildItem -Path "dist" -Filter "RoverSetup-*.exe" | Select-Object -First 1).FullName
+
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $installer --clobber
+          } else {
+            gh release create $tag $installer `
+              --title "Rover $ver (Pure Chromium 156 CEF)" `
+              --notes-file CHANGELOG.md
+          }
